@@ -93,6 +93,7 @@ lowercase detail for logs.
 | `PermissionDenied` | The server refused the login, the socket refused this user, or the system refused access to the microphone |
 | `Disconnected` | The server closed the connection or ended the stream |
 | `Stalled` | Opening took more than 3 s, or the server sent no audio for 5 s |
+| `Overrun` | Audio was lost, on macOS and Windows, so the recording has a gap |
 | `Protocol` | The server sent something Capta can't read |
 | `Unsupported` | A rate, piece length, network server or protocol version Capta doesn't support |
 | `Io` | The operating system failed a call |
@@ -104,6 +105,11 @@ device has it, preferring `f32` and the fewest channels, else the device's defau
 mixes the channels down to mono, and `on_audio` gets the rate it records at. cpal's stream
 lives on a thread of the capture's own, since it isn't `Send` everywhere, and cpal calls
 `on_audio` on its audio thread.
+
+Opening has 3 s here too. A device still opening after that is left to its thread, which
+drops it once it opens, and once four are left like that, opening fails at once. When cpal
+reports an overrun, audio was lost, so the capture ends with `Overrun` before the next buffer
+reaches `on_audio`.
 
 Cargo resolves dependencies for every platform at once, and only one package in a project may
 link ALSA. So a project that uses Capta can't also use a crate that links another version of

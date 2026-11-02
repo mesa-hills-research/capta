@@ -21,7 +21,6 @@ const MAX_LATE_STARTS: usize = 4;
 
 /// Captures whose thread is still opening the device after `open` gave up on it.
 static LATE_STARTS: AtomicUsize = AtomicUsize::new(0);
-
 thread_local! {
     /// Whether this thread is inside `on_audio`, where dropping the capture mustn't wait.
     static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
@@ -259,37 +258,25 @@ fn start(
         sample_rate: rate,
         buffer_size: cpal::BufferSize::Default,
     };
-    let on_failure = move |error: cpal::Error| {
-        if is_fatal(error.kind()) {
-            let _ = messages.send(Message::Failed(error));
-        }
-    };
-    let timeout = deadline.saturating_duration_since(Instant::now());
+    let timeout = Some(deadline.saturating_duration_since(Instant::now()));
+    let on_failure = failure_callback(Arc::clone(&gate.failed), messages);
+    let channels = usize::from(config.channels().max(1));
+    macro_rules! build {
+        ($sample:ty) => {{
+            let mut on_data = data_callback::<$sample>(channels, rate, on_audio, gate);
+            let on_data = move |data: &[$sample], _: &cpal::InputCallbackInfo| on_data(data);
+            device.build_input_stream::<$sample, _, _>(stream_config, on_data, on_failure, timeout)
+        }};
+    }
     let stream = match config.sample_format() {
-        SampleFormat::F32 => {
-            input::<f32>(&device, stream_config, timeout, on_audio, gate, on_failure)
-        }
-        SampleFormat::F64 => {
-            input::<f64>(&device, stream_config, timeout, on_audio, gate, on_failure)
-        }
-        SampleFormat::I8 => {
-            input::<i8>(&device, stream_config, timeout, on_audio, gate, on_failure)
-        }
-        SampleFormat::I16 => {
-            input::<i16>(&device, stream_config, timeout, on_audio, gate, on_failure)
-        }
-        SampleFormat::I32 => {
-            input::<i32>(&device, stream_config, timeout, on_audio, gate, on_failure)
-        }
-        SampleFormat::U8 => {
-            input::<u8>(&device, stream_config, timeout, on_audio, gate, on_failure)
-        }
-        SampleFormat::U16 => {
-            input::<u16>(&device, stream_config, timeout, on_audio, gate, on_failure)
-        }
-        SampleFormat::U32 => {
-            input::<u32>(&device, stream_config, timeout, on_audio, gate, on_failure)
-        }
+        SampleFormat::F32 => build!(f32),
+        SampleFormat::F64 => build!(f64),
+        SampleFormat::I8 => build!(i8),
+        SampleFormat::I16 => build!(i16),
+        SampleFormat::I32 => build!(i32),
+        SampleFormat::U8 => build!(u8),
+        SampleFormat::U16 => build!(u16),
+        SampleFormat::U32 => build!(u32),
         other => {
             return Err(Error::new(
                 ErrorKind::Unsupported,
@@ -309,23 +296,20 @@ fn is_decodable(format: SampleFormat) -> bool {
     matches!(format, F32 | F64 | I8 | I16 | I32 | U8 | U16 | U32)
 }
 
-/// Builds a stream that mixes the device's channels down to mono.
-fn input<T>(
-    device: &cpal::Device,
-    config: cpal::StreamConfig,
-    timeout: Duration,
+/// What cpal calls with each buffer. It mixes the device's channels down to mono and hands
+/// them to `on_audio` while the gate is open.
+fn data_callback<T>(
+    channels: usize,
+    rate: u32,
     mut on_audio: OnAudio,
     gate: Gate,
-    on_failure: impl FnMut(cpal::Error) + Send + 'static,
-) -> Result<cpal::Stream, cpal::Error>
+) -> impl FnMut(&[T]) + Send + 'static
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
-    let channels = usize::from(config.channels.max(1));
-    let rate = config.sample_rate;
     let mut mono = Vec::new();
-    let on_data = move |data: &[T], _: &cpal::InputCallbackInfo| {
+    move |data: &[T]| {
         if !gate.is_open() {
             return;
         }
@@ -340,15 +324,28 @@ where
         IN_CALLBACK.set(true);
         on_audio(&mono, rate);
         IN_CALLBACK.set(false);
-    };
-    device.build_input_stream::<T, _, _>(config, on_data, on_failure, Some(timeout))
+    }
 }
 
-/// Whether an error ends the recording. cpal reports some it recovers from.
+/// What cpal calls with an error. One that ends the recording closes the gate at once, so the
+/// buffer after it never reaches `on_audio`, and goes to the capture thread.
+fn failure_callback(
+    failed: Arc<AtomicBool>,
+    messages: mpsc::Sender<Message>,
+) -> impl FnMut(cpal::Error) + Send + 'static {
+    move |error: cpal::Error| {
+        if is_fatal(error.kind()) && !failed.swap(true, Ordering::SeqCst) {
+            let _ = messages.send(Message::Failed(error));
+        }
+    }
+}
+
+/// Whether an error ends the recording. An overrun means audio was lost, so it does, though
+/// cpal goes on. A change of route and a refused real-time priority don't.
 fn is_fatal(kind: cpal::ErrorKind) -> bool {
     !matches!(
         kind,
-        cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::Xrun | cpal::ErrorKind::RealtimeDenied
+        cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::RealtimeDenied
     )
 }
 
@@ -359,10 +356,67 @@ fn convert(error: cpal::Error, doing: &str) -> Error {
         cpal::ErrorKind::DeviceBusy => ErrorKind::Busy,
         cpal::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
         cpal::ErrorKind::StreamInvalidated => ErrorKind::Disconnected,
+        cpal::ErrorKind::Xrun => ErrorKind::Overrun,
         cpal::ErrorKind::UnsupportedConfig
         | cpal::ErrorKind::UnsupportedOperation
         | cpal::ErrorKind::InvalidInput => ErrorKind::Unsupported,
         _ => ErrorKind::Io,
     };
     Error::new(kind, format!("{doing} failed ({error})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gate() -> Gate {
+        Gate {
+            stop: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn an_overrun_ends_the_recording_before_the_next_buffer() {
+        let gate = gate();
+        let failed = Arc::clone(&gate.failed);
+        let (heard, pieces) = mpsc::channel();
+        let mut on_data = data_callback::<f32>(
+            2,
+            48_000,
+            Box::new(move |samples: &[f32], _: u32| heard.send(samples.to_vec()).unwrap()),
+            gate,
+        );
+        let (messages, inbox) = mpsc::channel();
+        let mut on_failure = failure_callback(failed, messages);
+        on_data(&[0.5, 0.25, -0.5, 0.0]);
+        assert_eq!(pieces.try_recv().unwrap(), [0.375, -0.25]);
+        on_failure(cpal::Error::new(cpal::ErrorKind::Xrun));
+        on_failure(cpal::Error::new(cpal::ErrorKind::Xrun));
+        on_data(&[0.5, 0.5]);
+        assert!(pieces.try_recv().is_err(), "audio after the gap");
+        assert!(matches!(inbox.try_recv(), Ok(Message::Failed(_))));
+        assert!(inbox.try_recv().is_err(), "a second failure");
+        let error = convert(cpal::Error::new(cpal::ErrorKind::Xrun), "recording");
+        assert_eq!(error.kind(), ErrorKind::Overrun);
+    }
+
+    #[test]
+    fn a_route_change_keeps_recording() {
+        let gate = gate();
+        let failed = Arc::clone(&gate.failed);
+        let (heard, pieces) = mpsc::channel();
+        let mut on_data = data_callback::<i16>(
+            1,
+            48_000,
+            Box::new(move |samples: &[f32], _: u32| heard.send(samples.len()).unwrap()),
+            gate,
+        );
+        let (messages, inbox) = mpsc::channel();
+        let mut on_failure = failure_callback(failed, messages);
+        on_failure(cpal::Error::new(cpal::ErrorKind::DeviceChanged));
+        on_data(&[1, 2, 3]);
+        assert_eq!(pieces.try_recv().unwrap(), 3);
+        assert!(inbox.try_recv().is_err());
+    }
 }

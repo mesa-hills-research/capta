@@ -16,6 +16,9 @@ pub enum ErrorKind {
     Disconnected,
     /// The sound server stopped answering or sending audio.
     Stalled,
+    /// Audio was lost because the system didn't keep up, so the recording has a gap. macOS
+    /// and Windows report it.
+    Overrun,
     /// The sound server sent something that can't be read.
     Protocol,
     /// The options ask for something the system can't do, such as a network sound server.
