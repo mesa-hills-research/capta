@@ -34,6 +34,12 @@ fn run() -> Result<(), String> {
         );
     };
     let seconds: f64 = parse(rest.first(), 5.0, "length in seconds")?;
+    let length = Duration::try_from_secs_f64(seconds)
+        .ok()
+        .filter(|length| Instant::now().checked_add(*length).is_some())
+        .ok_or_else(|| {
+            format!("The length in seconds is out of range ({seconds}). Give 0 or more.")
+        })?;
     let rate: u32 = parse(rest.get(1), 16_000, "rate in Hz")?;
     let options = capta::Options {
         device: rest.get(2).cloned(),
@@ -63,7 +69,9 @@ fn run() -> Result<(), String> {
     );
 
     let mut samples = Vec::new();
-    let end = Instant::now() + Duration::from_secs_f64(seconds);
+    let end = Instant::now()
+        .checked_add(length)
+        .ok_or("The length in seconds is too long.")?;
     while let Some(left) = end.checked_duration_since(Instant::now()) {
         if let Ok(error) = failed.try_recv() {
             eprintln!("The microphone stopped ({error}).");
