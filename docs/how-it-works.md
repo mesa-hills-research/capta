@@ -84,17 +84,26 @@ one until its deadline, then fails as `Stalled`.
 
 Before each phase, the startup thread checks the deadline and stops once it has passed. On
 Linux the phases are reading the cookie and each connection attempt. Through cpal they're
-finding the device, choosing its format, building the stream and starting it. The phases that
+listing the devices, or finding the device, choosing its format, building the stream and
+starting it. The phases that
 run on the caller's thread, the requests on Linux, check the deadline before every read or
 write, and a reply already buffered when the deadline passes is refused.
 
 ### Acceptance
 
-A result counts only if the startup thread finishes before the deadline. The thread and the
-waiting caller settle that with one atomic step, so a result is either handed over or given
-up, never both. The startup thread disposes of a result that comes too late itself. It closes
-a late socket, or stops and drops a late cpal stream without calling back, and only then gives
-its permit back.
+A startup's outcome is decided once, by whichever of the startup thread and the waiting
+caller gets there first. The thread hands its result over if it finishes before the deadline.
+Otherwise the startup is given up, by the thread when it finishes late or by the caller when
+its wait ends, and either way the caller returns `Stalled` without waiting any longer. A
+decision is final.
+
+A handover decided before the deadline counts even when the caller receives it a little after,
+because sending the result follows the decision and the thread may be paused in between. So the
+deadline bounds when a startup must finish, and the caller may return a moment later.
+
+The startup thread disposes of a result that comes too late itself. It closes a late socket,
+or stops and drops a late cpal stream without calling back, and only then gives its permit
+back.
 
 ## Recording
 
@@ -140,8 +149,10 @@ lives on a thread of the capture's own, since it isn't `Send` everywhere, and cp
 `on_audio` on its audio thread.
 
 Starting follows the lifecycle above, on the capture's thread, which gives its permit back once
-the stream is handed over or dropped. When cpal reports an overrun, audio was lost, so the
-capture ends with `Overrun` before the next buffer reaches `on_audio`.
+the stream is handed over or dropped. The device starts before the handover, and `on_audio`
+gets nothing until the capture's thread opens the gate just after it. So the first buffers are
+dropped, and the gate can open a little after `open` returns. When cpal reports an overrun,
+audio was lost, so the capture ends with `Overrun` before the next buffer reaches `on_audio`.
 
 Cargo resolves dependencies for every platform at once, and only one package in a project may
 link ALSA. So a project that uses Capta can't also use a crate that links another version of
