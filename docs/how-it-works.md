@@ -17,10 +17,11 @@ Capta connects to the first socket that answers, in libpulse's order.
 4. `/run/user/<uid>/pulse/native`
 5. `/run/pulse/native`
 
-The cookie comes from `$PULSE_COOKIE`, `$XDG_CONFIG_HOME/pulse/cookie` (or
-`~/.config/pulse/cookie`) or `~/.pulse-cookie`, else it's 256 zero bytes. pipewire-pulse checks
-only the cookie's length, and PulseAudio lets in a client of its own user by the socket's
-credentials. Capta never writes a cookie.
+The cookie comes from the first regular file of `$PULSE_COOKIE`, `$XDG_CONFIG_HOME/pulse/cookie`
+(or `~/.config/pulse/cookie`) and `~/.pulse-cookie` that holds 256 bytes, else it's 256 zero
+bytes. Capta reads only those 256 bytes, and passes over pipes and devices. pipewire-pulse
+checks only the cookie's length, and PulseAudio lets in a client of its own user by the
+socket's credentials. Capta never writes a cookie.
 
 When no socket answers but PipeWire's own socket exists, the error says to install
 pipewire-pulse. Taking the device from under PipeWire would break every other program's audio.
@@ -66,13 +67,14 @@ async runtime's workers.
 ### Deadline
 
 A startup has 3 s from the moment the public call begins, for everything it does. On Linux
-that's connecting, and every request and reply, however the server spreads its bytes. Through cpal it's listing the devices, choosing a format, building the stream and
+that's reading the cookie, connecting, and every request and reply, however the server spreads
+its bytes. Through cpal it's listing the devices, choosing a format, building the stream and
 starting it.
 
 ### Admission
 
-Some of that work can block where std can't time it out, such as connecting a Unix socket or
-a stuck audio driver. That work runs on a startup
+Some of that work can block where std can't time it out, such as connecting a Unix socket,
+reading a file on a hung filesystem, or a stuck audio driver. That work runs on a startup
 thread. Before the thread starts, the startup takes one of four permits, and the thread holds
 it until it has finished and cleaned up, however it ends, a panic included. So at most four
 startups run blocking work at once in a process. A startup that finds all four taken waits for
@@ -81,7 +83,7 @@ one until its deadline, then fails as `Stalled`.
 ### Cancellation
 
 Before each phase, the startup thread checks the deadline and stops once it has passed. On
-Linux the phases are the connection attempts. Through cpal they're
+Linux the phases are reading the cookie and each connection attempt. Through cpal they're
 finding the device, choosing its format, building the stream and starting it. The phases that
 run on the caller's thread, the requests on Linux, check the deadline before every read or
 write, and a reply already buffered when the deadline passes is refused.

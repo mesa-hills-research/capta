@@ -1,6 +1,7 @@
 //! Where the sound server listens and which cookie to show it, in libpulse's order.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::{Error, ErrorKind};
@@ -87,28 +88,43 @@ pub fn no_server(env: Env<'_>, uid: Option<u32>) -> Error {
     }
 }
 
-/// The first cookie file that holds a whole cookie, else zeros. pipewire-pulse checks only
-/// the length, and PulseAudio lets a client of its own user in by the socket's credentials.
-pub fn cookie(env: Env<'_>) -> Vec<u8> {
+/// Where the cookie may be, in libpulse's order.
+pub fn cookie_paths(env: Env<'_>) -> Vec<PathBuf> {
     let home = env("HOME").map(PathBuf::from);
     let config = env("XDG_CONFIG_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| home.as_ref().map(|home| home.join(".config")));
-    let paths = [
+    [
         env("PULSE_COOKIE").map(PathBuf::from),
         config.map(|dir| dir.join("pulse/cookie")),
         home.map(|home| home.join(".pulse-cookie")),
-    ];
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The first regular file in `paths` that holds a whole cookie, else zeros. Only the cookie's
+/// bytes are read, and anything other than a regular file, such as a pipe, is passed over.
+/// pipewire-pulse checks only the length, and PulseAudio lets a client of its own user in by
+/// the socket's credentials.
+pub fn read_cookie(paths: &[PathBuf]) -> Vec<u8> {
+    let read = |path: &PathBuf| -> Option<Vec<u8>> {
+        if !std::fs::metadata(path).ok()?.is_file() {
+            return None;
+        }
+        let mut cookie = Vec::with_capacity(COOKIE_LENGTH);
+        std::fs::File::open(path)
+            .ok()?
+            .take(COOKIE_LENGTH as u64)
+            .read_to_end(&mut cookie)
+            .ok()?;
+        (cookie.len() == COOKIE_LENGTH).then_some(cookie)
+    };
     paths
-        .into_iter()
-        .flatten()
-        .filter_map(|path| std::fs::read(path).ok())
-        .find(|bytes| bytes.len() >= COOKIE_LENGTH)
-        .map(|mut bytes| {
-            bytes.truncate(COOKIE_LENGTH);
-            bytes
-        })
+        .iter()
+        .find_map(read)
         .unwrap_or_else(|| vec![0; COOKIE_LENGTH])
 }
 
@@ -204,9 +220,29 @@ mod tests {
             ("XDG_CONFIG_HOME", dir.join("config").to_str().unwrap()),
             ("HOME", dir.to_str().unwrap()),
         ]);
-        assert_eq!(cookie(&env), vec![0; COOKIE_LENGTH]);
+        assert_eq!(read_cookie(&cookie_paths(&env)), vec![0; COOKIE_LENGTH]);
         std::fs::write(dir.join("config/pulse/cookie"), [7; 300]).unwrap();
-        assert_eq!(cookie(&env), vec![7; COOKIE_LENGTH]);
+        assert_eq!(read_cookie(&cookie_paths(&env)), vec![7; COOKIE_LENGTH]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cookie_that_isnt_a_regular_file_is_passed_over() {
+        let dir = std::env::temp_dir().join(format!("capta-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("cookie");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let cookie = std::fs::write(dir.join("whole"), [3; COOKIE_LENGTH]);
+        cookie.unwrap();
+        let paths = vec![fifo, dir.join("whole")];
+        let (sender, read) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(read_cookie(&paths)).unwrap());
+        let cookie = read.recv_timeout(std::time::Duration::from_secs(1));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(cookie.expect("blocked on the pipe"), vec![3; COOKIE_LENGTH]);
     }
 }

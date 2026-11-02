@@ -74,19 +74,20 @@ impl Default for Timeouts {
     }
 }
 
-/// Where the sound server may listen, and what to show it.
+/// Where the sound server may listen, and where its cookie may be.
 pub(crate) struct Server {
     pub paths: Vec<PathBuf>,
-    pub cookie: Vec<u8>,
+    pub cookies: Vec<PathBuf>,
     pub timeouts: Timeouts,
 }
 
 impl Server {
+    /// Reads only the environment and `/proc`. The files wait for the startup thread.
     fn from_env() -> Result<Server, Error> {
         let env = |name: &str| std::env::var_os(name);
         Ok(Server {
             paths: discovery::candidates(&env, discovery::uid())?,
-            cookie: discovery::cookie(&env),
+            cookies: discovery::cookie_paths(&env),
             timeouts: Timeouts::default(),
         })
     }
@@ -495,12 +496,13 @@ struct Connection {
 type Connected = Result<(UnixStream, Vec<u8>), Error>;
 
 impl Connection {
-    /// Connects to the first server that answers and logs in, by `deadline`. Connecting runs
-    /// on a startup thread, since std can't time it out.
+    /// Connects to the first server that answers and logs in, by `deadline`. Reading the
+    /// cookie and connecting run on a startup thread, since std can time out neither.
     fn connect(server: &Server, app_name: &str, deadline: Instant) -> Result<Connection, Error> {
         let paths = server.paths.clone();
-        let cookie = server.cookie.clone();
+        let cookies = server.cookies.clone();
         let connecting = move |start: Start<Connected>| {
+            let cookie = discovery::read_cookie(&cookies);
             let mut refused = None;
             for path in &paths {
                 if start.is_over() {

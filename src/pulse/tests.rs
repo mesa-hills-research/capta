@@ -68,7 +68,7 @@ fn serve(script: impl FnOnce(&mut Peer) + Send + 'static) -> (Server, JoinHandle
     (
         Server {
             paths: vec![path],
-            cookie: vec![0; 256],
+            cookies: Vec::new(),
             timeouts: QUICK,
         },
         thread,
@@ -684,6 +684,36 @@ fn a_late_socket_is_closed() {
     assert_eq!(peer.read(&mut [0]).unwrap(), 0);
 }
 
+#[test]
+fn a_pipe_as_cookie_doesnt_hold_up_listing() {
+    let dir = std::env::temp_dir().join(format!("capta-test-fifo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("cookie");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    assert!(made.unwrap().success());
+    let (mut server, thread) = serve(|peer| {
+        let read = |body: &[u8]| reference::Command::read_tag_prefixed(&mut Cursor::new(body), 35);
+        let (sequence, body) = peer.expect(command::AUTH);
+        let (_, reference::Command::Auth(auth)) = read(&body).unwrap() else {
+            panic!()
+        };
+        assert_eq!(auth.cookie, [0; 256]);
+        peer.replay(fixture!("auth-reply"), sequence);
+        let (sequence, _) = peer.expect(command::SET_CLIENT_NAME);
+        peer.replay(fixture!("client-name-reply"), sequence);
+        let (sequence, _) = peer.expect(command::GET_SERVER_INFO);
+        peer.replay(fixture!("server-info-reply"), sequence);
+        let (sequence, _) = peer.expect(command::GET_SOURCE_INFO_LIST);
+        peer.replay(fixture!("source-info-list-reply"), sequence);
+        peer.wait_for_close();
+    });
+    server.cookies = vec![fifo];
+    let devices = devices_with(&server, "Tester");
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(devices.unwrap().len(), 1);
+    thread.join().unwrap();
+}
+
 /// Sends audio until the client goes away.
 fn stream_until_closed(peer: &mut Peer) {
     peer.open();
@@ -775,7 +805,7 @@ fn devices_leave_monitors_out() {
 fn a_missing_socket_is_no_server() {
     let server = Server {
         paths: vec![std::env::temp_dir().join("capta-test-missing/native")],
-        cookie: vec![0; 256],
+        cookies: Vec::new(),
         timeouts: QUICK,
     };
     assert_eq!(
