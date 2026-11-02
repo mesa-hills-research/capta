@@ -4,7 +4,7 @@
 //! and drops it. cpal calls `on_audio` on its own audio thread.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -21,9 +21,12 @@ const MAX_LATE_STARTS: usize = 4;
 
 /// Captures whose thread is still opening the device after `open` gave up on it.
 static LATE_STARTS: AtomicUsize = AtomicUsize::new(0);
+/// The last capture's number. Numbers start at 1.
+static LAST_CAPTURE: AtomicU64 = AtomicU64::new(0);
+
 thread_local! {
-    /// Whether this thread is inside `on_audio`, where dropping the capture mustn't wait.
-    static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
+    /// The number of the capture whose `on_audio` this thread is in, or 0.
+    static IN_CALLBACK_OF: Cell<u64> = const { Cell::new(0) };
 }
 
 pub(crate) fn devices() -> Result<Vec<Device>, Error> {
@@ -53,6 +56,7 @@ fn describe(device: &cpal::Device, default: Option<&cpal::DeviceId>) -> Device {
 
 /// A running capture's handle.
 pub(crate) struct Stream {
+    number: u64,
     stop: Arc<AtomicBool>,
     messages: mpsc::Sender<Message>,
     thread: Option<JoinHandle<()>>,
@@ -68,10 +72,11 @@ impl Drop for Stream {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.messages.send(Message::Stop);
-        // From a callback, the thread can't drop cpal's stream until the callback returns.
+        // From one of this capture's callbacks, the thread can't drop cpal's stream until the
+        // callback returns, so it's left to end by itself.
         if let Some(thread) = self.thread.take()
             && thread.thread().id() != std::thread::current().id()
-            && !IN_CALLBACK.get()
+            && IN_CALLBACK_OF.get() != self.number
         {
             let _ = thread.join();
         }
@@ -95,6 +100,7 @@ pub(crate) fn open(
             "the audio system is still opening earlier captures",
         ));
     }
+    let number = LAST_CAPTURE.fetch_add(1, Ordering::SeqCst) + 1;
     let stop = Arc::new(AtomicBool::new(false));
     let state = Arc::new(AtomicU8::new(STARTING));
     let (messages, inbox) = mpsc::channel();
@@ -108,6 +114,7 @@ pub(crate) fn open(
             move || {
                 let failed = Arc::new(AtomicBool::new(false));
                 let gate = Gate {
+                    number,
                     stop: Arc::clone(&stop),
                     failed: Arc::clone(&failed),
                 };
@@ -149,6 +156,7 @@ pub(crate) fn open(
             )
         })?;
     let stream = Stream {
+        number,
         stop,
         messages,
         thread: Some(thread),
@@ -197,6 +205,7 @@ pub(crate) fn open(
 
 /// What stops callbacks, once the capture is dropped or has failed.
 struct Gate {
+    number: u64,
     stop: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
 }
@@ -321,9 +330,27 @@ where
                 .sum::<f32>()
                 / channels as f32
         }));
-        IN_CALLBACK.set(true);
+        let _inside = InCallback::enter(gate.number);
         on_audio(&mono, rate);
-        IN_CALLBACK.set(false);
+    }
+}
+
+/// Marks this thread as inside a capture's `on_audio` until dropped.
+struct InCallback {
+    outer: u64,
+}
+
+impl InCallback {
+    fn enter(number: u64) -> InCallback {
+        InCallback {
+            outer: IN_CALLBACK_OF.replace(number),
+        }
+    }
+}
+
+impl Drop for InCallback {
+    fn drop(&mut self) {
+        IN_CALLBACK_OF.set(self.outer);
     }
 }
 
@@ -369,8 +396,9 @@ fn convert(error: cpal::Error, doing: &str) -> Error {
 mod tests {
     use super::*;
 
-    fn gate() -> Gate {
+    fn gate(number: u64) -> Gate {
         Gate {
+            number,
             stop: Arc::new(AtomicBool::new(false)),
             failed: Arc::new(AtomicBool::new(false)),
         }
@@ -378,7 +406,7 @@ mod tests {
 
     #[test]
     fn an_overrun_ends_the_recording_before_the_next_buffer() {
-        let gate = gate();
+        let gate = gate(1);
         let failed = Arc::clone(&gate.failed);
         let (heard, pieces) = mpsc::channel();
         let mut on_data = data_callback::<f32>(
@@ -403,7 +431,7 @@ mod tests {
 
     #[test]
     fn a_route_change_keeps_recording() {
-        let gate = gate();
+        let gate = gate(1);
         let failed = Arc::clone(&gate.failed);
         let (heard, pieces) = mpsc::channel();
         let mut on_data = data_callback::<i16>(
@@ -418,5 +446,22 @@ mod tests {
         on_data(&[1, 2, 3]);
         assert_eq!(pieces.try_recv().unwrap(), 3);
         assert!(inbox.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_callback_knows_its_own_capture() {
+        let (heard, inside) = mpsc::channel();
+        let mut on_data = data_callback::<f32>(
+            1,
+            48_000,
+            Box::new(move |_: &[f32], _: u32| heard.send(IN_CALLBACK_OF.get()).unwrap()),
+            gate(7),
+        );
+        let outer = InCallback::enter(3);
+        on_data(&[0.0]);
+        assert_eq!(inside.try_recv().unwrap(), 7);
+        assert_eq!(IN_CALLBACK_OF.get(), 3);
+        drop(outer);
+        assert_eq!(IN_CALLBACK_OF.get(), 0);
     }
 }
