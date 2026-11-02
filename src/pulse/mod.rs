@@ -13,11 +13,12 @@ use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::startup::{self, Late, STARTS, Start};
 use crate::{Device, Error, ErrorKind, OnAudio, OnError, Opened, Options};
 use tagstruct::{Malformed, Reader, SampleSpec, Writer};
 
@@ -73,12 +74,6 @@ impl Default for Timeouts {
     }
 }
 
-/// Connections that missed their deadline and still wait in a thread of their own, behind a
-/// server that doesn't accept them.
-static WAITING_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
-/// How many connections may wait like that before opening fails at once.
-const MAX_WAITING: usize = 4;
-
 /// Where the sound server may listen, and what to show it.
 pub(crate) struct Server {
     pub paths: Vec<PathBuf>,
@@ -110,7 +105,8 @@ pub(crate) fn open(
 }
 
 fn devices_with(server: &Server, app_name: &str) -> Result<Vec<Device>, Error> {
-    let mut connection = Connection::connect(server, app_name)?;
+    let deadline = Instant::now() + server.timeouts.open;
+    let mut connection = Connection::connect(server, app_name, deadline)?;
     let default = connection.default_source()?;
     let reply = connection.request(
         command::GET_SOURCE_INFO_LIST,
@@ -134,7 +130,8 @@ fn open_with(
     on_audio: OnAudio,
     on_error: OnError,
 ) -> Result<Opened, Error> {
-    let mut connection = Connection::connect(server, &options.app_name)?;
+    let deadline = Instant::now() + server.timeouts.open;
+    let mut connection = Connection::connect(server, &options.app_name, deadline)?;
     let default = connection.default_source()?;
     let Some(wanted) = options.device.clone().or_else(|| default.clone()) else {
         return Err(Error::new(
@@ -344,9 +341,10 @@ impl Recording {
                 Some(packet) if packet.channel == self.channel => {
                     decode(packet.body, &mut partial, &mut samples);
                     if !samples.is_empty() {
-                        audio_due = Instant::now() + stall;
                         (self.on_audio)(&samples, self.rate);
                         samples.clear();
+                        // A slow callback doesn't count against the server.
+                        audio_due = Instant::now() + stall;
                     }
                 }
                 Some(packet) if packet.channel == CONTROL => {
@@ -493,55 +491,76 @@ struct Connection {
     deadline: Instant,
 }
 
+/// What the startup thread hands over, a connected socket and the cookie to show.
+type Connected = Result<(UnixStream, Vec<u8>), Error>;
+
 impl Connection {
-    /// Connects to the first server that answers and logs in, all within the time allowed
-    /// for opening.
-    fn connect(server: &Server, app_name: &str) -> Result<Connection, Error> {
-        let deadline = Instant::now() + server.timeouts.open;
-        let mut refused = None;
-        for path in &server.paths {
-            let connecting = {
-                let path = path.clone();
-                move || UnixStream::connect(path)
-            };
-            match finish_by(deadline, &WAITING_CONNECTIONS, connecting) {
-                Ok(Ok(socket)) => return Connection::log_in(socket, server, app_name, deadline),
-                Ok(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied => {
-                    refused = Some(path)
+    /// Connects to the first server that answers and logs in, by `deadline`. Connecting runs
+    /// on a startup thread, since std can't time it out.
+    fn connect(server: &Server, app_name: &str, deadline: Instant) -> Result<Connection, Error> {
+        let paths = server.paths.clone();
+        let cookie = server.cookie.clone();
+        let connecting = move |start: Start<Connected>| {
+            let mut refused = None;
+            for path in &paths {
+                if start.is_over() {
+                    return;
                 }
-                Ok(Err(_)) => {}
-                Err(Late::Deadline) => {
-                    return Err(Error::new(
-                        ErrorKind::Stalled,
-                        format!(
-                            "the sound server at {} didn't accept the connection within {:.1} s",
-                            path.display(),
-                            server.timeouts.open.as_secs_f32()
-                        ),
-                    ));
-                }
-                Err(Late::Crowded) => {
-                    return Err(Error::new(
-                        ErrorKind::Stalled,
-                        "earlier connections to the sound server are still waiting",
-                    ));
+                match UnixStream::connect(path) {
+                    // A socket that comes too late comes back here and closes.
+                    Ok(socket) => {
+                        let _ = start.finish(Ok((socket, cookie)));
+                        return;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                        refused = Some(path)
+                    }
+                    Err(_) => {}
                 }
             }
-        }
-        Err(match refused {
-            Some(path) => Error::new(
-                ErrorKind::PermissionDenied,
-                format!(
-                    "this user may not connect to the sound server at {}",
-                    path.display()
+            let _ = start.finish(Err(match refused {
+                Some(path) => Error::new(
+                    ErrorKind::PermissionDenied,
+                    format!(
+                        "this user may not connect to the sound server at {}",
+                        path.display()
+                    ),
                 ),
-            ),
-            None => discovery::no_server(&|name| std::env::var_os(name), discovery::uid()),
-        })
+                None => discovery::no_server(&|name| std::env::var_os(name), discovery::uid()),
+            }));
+        };
+        let allowed = server.timeouts.open.as_secs_f32();
+        let (socket, cookie) = match startup::run("capta-connect", deadline, &STARTS, connecting) {
+            Ok((connected, _thread)) => connected?,
+            Err(Late::Deadline) => {
+                return Err(Error::new(
+                    ErrorKind::Stalled,
+                    format!(
+                        "connecting to the sound server took more than the {allowed:.1} s allowed"
+                    ),
+                ));
+            }
+            Err(Late::Crowded) => {
+                return Err(Error::new(
+                    ErrorKind::Stalled,
+                    format!(
+                        "earlier starts were still waiting on the sound server after {allowed:.1} s"
+                    ),
+                ));
+            }
+            Err(Late::Failed) => {
+                return Err(Error::new(
+                    ErrorKind::Io,
+                    "the thread connecting to the sound server failed",
+                ));
+            }
+        };
+        Connection::log_in(socket, &cookie, server, app_name, deadline)
     }
 
     fn log_in(
         socket: UnixStream,
+        cookie: &[u8],
         server: &Server,
         app_name: &str,
         deadline: Instant,
@@ -558,7 +577,7 @@ impl Connection {
         };
         let reply = connection.request(command::AUTH, "the login", |w| {
             // The version, with the flags for shared memory and memfd left clear.
-            w.u32(VERSION).arbitrary(&server.cookie);
+            w.u32(VERSION).arbitrary(cookie);
         })?;
         // The server's flags take the top bits.
         let server_version = Reader::new(&reply).u32()? & 0xffff;
@@ -692,9 +711,13 @@ impl Connection {
         )
     }
 
-    /// The next packet, or `None` when `deadline` passes first. A packet the deadline cuts
-    /// stays buffered for the next call. Each header is checked as soon as it's read.
+    /// The next packet, or `None` once `deadline` has passed, even when one is buffered. A
+    /// packet the deadline cuts stays buffered for the next call. Each header is checked as
+    /// soon as it's read.
     fn read_packet(&mut self, deadline: Instant) -> Result<Option<Packet<'_>>, Error> {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
         let length = loop {
             let buffered = self.end - self.start;
             let needed = if buffered < HEADER {
@@ -780,62 +803,6 @@ fn check_header(header: &[u8]) -> Result<usize, Error> {
         );
     }
     Ok(length)
-}
-
-/// Why work on a helper thread didn't come back.
-#[derive(Debug, PartialEq)]
-enum Late {
-    /// It missed the deadline.
-    Deadline,
-    /// Too many earlier ones still wait, or no thread could start.
-    Crowded,
-}
-
-/// Runs `work` on a thread of its own and waits for it until `deadline`, for blocking calls
-/// that std can't time out, such as connecting. Work that misses the deadline finishes by
-/// itself later, and `waiting` counts it until then. Once [`MAX_WAITING`] wait behind a
-/// server that never answers, calls fail at once rather than start more threads.
-fn finish_by<T: Send + 'static>(
-    deadline: Instant,
-    waiting: &'static AtomicUsize,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, Late> {
-    const RUNNING: u8 = 0;
-    const DONE: u8 = 1;
-    const ABANDONED: u8 = 2;
-    if waiting.load(Ordering::SeqCst) >= MAX_WAITING {
-        return Err(Late::Crowded);
-    }
-    let state = Arc::new(AtomicU8::new(RUNNING));
-    let (sender, done) = mpsc::sync_channel(1);
-    let helper_state = Arc::clone(&state);
-    let spawned = std::thread::Builder::new()
-        .name("capta-connect".into())
-        .spawn(move || {
-            let _ = sender.send(work());
-            if helper_state
-                .compare_exchange(RUNNING, DONE, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                waiting.fetch_sub(1, Ordering::SeqCst);
-            }
-        });
-    if spawned.is_err() {
-        return Err(Late::Crowded);
-    }
-    if let Ok(result) = done.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        return Ok(result);
-    }
-    waiting.fetch_add(1, Ordering::SeqCst);
-    if state
-        .compare_exchange(RUNNING, ABANDONED, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
-        return Err(Late::Deadline);
-    }
-    // The work finished just after the deadline, and its result is waiting.
-    waiting.fetch_sub(1, Ordering::SeqCst);
-    done.try_recv().map_err(|_| Late::Deadline)
 }
 
 fn be_u32(bytes: &[u8]) -> u32 {

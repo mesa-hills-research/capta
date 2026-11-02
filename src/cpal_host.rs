@@ -4,23 +4,20 @@
 //! and drops it. cpal calls `on_audio` on its own audio thread.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 
+use crate::startup::{self, Late, STARTS, Start};
 use crate::{Device, Error, ErrorKind, OnAudio, OnError, Opened, Options};
 
-/// How long opening may take, from the start.
+/// How long listing or opening may take, from the start.
 const TIMEOUT: Duration = Duration::from_secs(3);
-/// How many captures may still be opening after their deadline before opening fails at once.
-const MAX_LATE_STARTS: usize = 4;
 
-/// Captures whose thread is still opening the device after `open` gave up on it.
-static LATE_STARTS: AtomicUsize = AtomicUsize::new(0);
 /// The last capture's number. Numbers start at 1.
 static LAST_CAPTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -30,16 +27,42 @@ thread_local! {
 }
 
 pub(crate) fn devices() -> Result<Vec<Device>, Error> {
-    let host = cpal::default_host();
-    let default = host
-        .default_input_device()
-        .and_then(|device| device.id().ok());
-    let devices = host
-        .input_devices()
-        .map_err(|error| convert(error, "listing the devices"))?;
-    Ok(devices
-        .map(|device| describe(&device, default.as_ref()))
-        .collect())
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let listing = |start: Start<Result<Vec<Device>, Error>>| {
+        let host = cpal::default_host();
+        let default = host
+            .default_input_device()
+            .and_then(|device| device.id().ok());
+        let devices = host
+            .input_devices()
+            .map_err(|error| convert(error, "listing the devices"))
+            .map(|devices| {
+                devices
+                    .map(|device| describe(&device, default.as_ref()))
+                    .collect()
+            });
+        let _ = start.finish(devices);
+    };
+    match startup::run("capta-devices", deadline, &STARTS, listing) {
+        Ok((devices, _thread)) => devices,
+        Err(late) => Err(late_error(late, "listing the devices")),
+    }
+}
+
+/// Why a startup gave no result, as an error.
+fn late_error(late: Late, doing: &str) -> Error {
+    let allowed = TIMEOUT.as_secs_f32();
+    match late {
+        Late::Deadline => Error::new(
+            ErrorKind::Stalled,
+            format!("{doing} took more than the {allowed:.1} s allowed"),
+        ),
+        Late::Crowded => Error::new(
+            ErrorKind::Stalled,
+            format!("earlier starts were still waiting on the audio system after {allowed:.1} s"),
+        ),
+        Late::Failed => Error::new(ErrorKind::Io, format!("the thread {doing} failed")),
+    }
 }
 
 fn describe(device: &cpal::Device, default: Option<&cpal::DeviceId>) -> Device {
@@ -83,147 +106,102 @@ impl Drop for Stream {
     }
 }
 
-/// Whether the opening thread is still at it, done, or given up on.
-const STARTING: u8 = 0;
-const STARTED: u8 = 1;
-const ABANDONED: u8 = 2;
-
 pub(crate) fn open(
     options: &Options,
     on_audio: OnAudio,
     on_error: OnError,
 ) -> Result<Opened, Error> {
-    let deadline = Instant::now() + TIMEOUT;
-    if LATE_STARTS.load(Ordering::SeqCst) >= MAX_LATE_STARTS {
-        return Err(Error::new(
-            ErrorKind::Stalled,
-            "the audio system is still opening earlier captures",
-        ));
-    }
+    let deadline = std::time::Instant::now() + TIMEOUT;
     let number = LAST_CAPTURE.fetch_add(1, Ordering::SeqCst) + 1;
     let stop = Arc::new(AtomicBool::new(false));
-    let state = Arc::new(AtomicU8::new(STARTING));
     let (messages, inbox) = mpsc::channel();
-    let (started_sender, started) = mpsc::sync_channel(1);
-    let thread = std::thread::Builder::new()
-        .name("capta".into())
-        .spawn({
-            let options = options.clone();
-            let (stop, state) = (Arc::clone(&stop), Arc::clone(&state));
-            let messages = messages.clone();
-            move || {
-                let failed = Arc::new(AtomicBool::new(false));
-                let gate = Gate {
-                    number,
-                    stop: Arc::clone(&stop),
-                    failed: Arc::clone(&failed),
-                };
-                let result = start(&options, deadline, on_audio, gate, messages);
-                let _ = started_sender.send(
-                    result
-                        .as_ref()
-                        .map(|(_, device, rate)| (device.clone(), *rate))
-                        .map_err(Error::clone),
-                );
-                if state
-                    .compare_exchange(STARTING, STARTED, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err()
-                {
-                    // `open` gave up on this capture, and the gate is closed.
-                    LATE_STARTS.fetch_sub(1, Ordering::SeqCst);
+    let controller = {
+        let options = options.clone();
+        let stop = Arc::clone(&stop);
+        let messages = messages.clone();
+        move |start: Start<Result<(Device, u32), Error>>| {
+            let gate = Gate {
+                number,
+                handed_over: Arc::new(AtomicBool::new(false)),
+                stop: Arc::clone(&stop),
+                failed: Arc::new(AtomicBool::new(false)),
+            };
+            let (handed_over, failed) = (Arc::clone(&gate.handed_over), Arc::clone(&gate.failed));
+            let stream = match start_stream(&options, &start, on_audio, gate, messages) {
+                Ok((stream, device, rate)) => {
+                    if start.finish(Ok((device, rate))).is_err() {
+                        // Too late. The gate never opened, so dropping the stream calls nothing.
+                        drop(stream);
+                        return;
+                    }
+                    handed_over.store(true, Ordering::SeqCst);
+                    stream
+                }
+                Err(error) => {
+                    let _ = start.finish(Err(error));
                     return;
                 }
-                let Ok((stream, _, _)) = result else { return };
-                if let Ok(Message::Failed(error)) = inbox.recv() {
-                    failed.store(true, Ordering::SeqCst);
-                    drop(stream);
-                    if !stop.load(Ordering::SeqCst) {
-                        let error = convert(error, "recording");
-                        on_error(match error.kind() {
-                            ErrorKind::NoDevice => {
-                                Error::new(ErrorKind::Disconnected, error.to_string())
-                            }
-                            _ => error,
-                        });
-                    }
+            };
+            // The stream is handed over, so the permit goes back.
+            drop(start);
+            if let Ok(Message::Failed(error)) = inbox.recv() {
+                failed.store(true, Ordering::SeqCst);
+                drop(stream);
+                if !stop.load(Ordering::SeqCst) {
+                    let error = convert(error, "recording");
+                    on_error(match error.kind() {
+                        ErrorKind::NoDevice => {
+                            Error::new(ErrorKind::Disconnected, error.to_string())
+                        }
+                        _ => error,
+                    });
                 }
             }
-        })
-        .map_err(|error| {
-            Error::new(
-                ErrorKind::Io,
-                format!("starting the capture thread failed ({error})"),
-            )
-        })?;
-    let stream = Stream {
-        number,
-        stop,
-        messages,
-        thread: Some(thread),
-    };
-    let result = match started.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(Error::new(
-            ErrorKind::Io,
-            "the capture thread ended before the recording started",
-        )),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            LATE_STARTS.fetch_add(1, Ordering::SeqCst);
-            if state
-                .compare_exchange(STARTING, ABANDONED, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                // Closing the gate keeps a late start silent, and the thread ends by itself.
-                let mut stream = stream;
-                stream.stop.store(true, Ordering::SeqCst);
-                stream.thread.take();
-                return Err(Error::new(
-                    ErrorKind::Stalled,
-                    format!(
-                        "the audio system didn't open the device within {:.1} s",
-                        TIMEOUT.as_secs_f32()
-                    ),
-                ));
-            }
-            // It started just after the deadline.
-            LATE_STARTS.fetch_sub(1, Ordering::SeqCst);
-            started.try_recv().unwrap_or_else(|_| {
-                Err(Error::new(
-                    ErrorKind::Io,
-                    "the capture thread ended before the recording started",
-                ))
-            })
         }
     };
-    let (device, sample_rate) = result?;
-    Ok(Opened {
-        stream,
-        device,
-        sample_rate,
-    })
+    match startup::run("capta", deadline, &STARTS, controller) {
+        Ok((Ok((device, sample_rate)), thread)) => Ok(Opened {
+            stream: Stream {
+                number,
+                stop,
+                messages,
+                thread: Some(thread),
+            },
+            device,
+            sample_rate,
+        }),
+        Ok((Err(error), _thread)) => Err(error),
+        Err(late) => Err(late_error(late, "opening the device")),
+    }
 }
 
-/// What stops callbacks, once the capture is dropped or has failed.
+/// What lets callbacks through, once the stream is handed over and until the capture is
+/// dropped or has failed.
 struct Gate {
     number: u64,
+    handed_over: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
 }
 
 impl Gate {
     fn is_open(&self) -> bool {
-        !self.stop.load(Ordering::SeqCst) && !self.failed.load(Ordering::SeqCst)
+        self.handed_over.load(Ordering::SeqCst)
+            && !self.stop.load(Ordering::SeqCst)
+            && !self.failed.load(Ordering::SeqCst)
     }
 }
 
-/// Opens the device and starts it, at the rate asked for when it has it.
-fn start(
+/// Opens the device and starts it, at the rate asked for when it has it. Each phase begins
+/// only while the startup is on.
+fn start_stream<T>(
     options: &Options,
-    deadline: Instant,
+    start: &Start<T>,
     on_audio: OnAudio,
     gate: Gate,
     messages: mpsc::Sender<Message>,
 ) -> Result<(cpal::Stream, Device, u32), Error> {
+    let over = || Error::new(ErrorKind::Stalled, "opening the device took too long");
     let host = cpal::default_host();
     let default = host.default_input_device();
     let default_id = default.as_ref().and_then(|device| device.id().ok());
@@ -242,6 +220,9 @@ fn start(
             })?,
     };
     let described = describe(&device, default_id.as_ref());
+    if start.is_over() {
+        return Err(over());
+    }
 
     let formats = device
         .supported_input_configs()
@@ -261,13 +242,16 @@ fn start(
             .default_input_config()
             .map_err(|error| convert(error, "reading the device's formats"))?,
     };
+    if start.is_over() {
+        return Err(over());
+    }
     let rate = config.sample_rate();
     let stream_config = cpal::StreamConfig {
         channels: config.channels(),
         sample_rate: rate,
         buffer_size: cpal::BufferSize::Default,
     };
-    let timeout = Some(deadline.saturating_duration_since(Instant::now()));
+    let timeout = Some(start.time_left());
     let on_failure = failure_callback(Arc::clone(&gate.failed), messages);
     let channels = usize::from(config.channels().max(1));
     macro_rules! build {
@@ -294,6 +278,9 @@ fn start(
         }
     }
     .map_err(|error| convert(error, "opening the device"))?;
+    if start.is_over() {
+        return Err(over());
+    }
     stream
         .play()
         .map_err(|error| convert(error, "starting the device"))?;
@@ -399,6 +386,7 @@ mod tests {
     fn gate(number: u64) -> Gate {
         Gate {
             number,
+            handed_over: Arc::new(AtomicBool::new(true)),
             stop: Arc::new(AtomicBool::new(false)),
             failed: Arc::new(AtomicBool::new(false)),
         }
@@ -427,6 +415,25 @@ mod tests {
         assert!(inbox.try_recv().is_err(), "a second failure");
         let error = convert(cpal::Error::new(cpal::ErrorKind::Xrun), "recording");
         assert_eq!(error.kind(), ErrorKind::Overrun);
+    }
+
+    #[test]
+    fn nothing_comes_before_the_stream_is_handed_over() {
+        let gate = gate(1);
+        let handed_over = Arc::clone(&gate.handed_over);
+        handed_over.store(false, Ordering::SeqCst);
+        let (heard, pieces) = mpsc::channel();
+        let mut on_data = data_callback::<f32>(
+            1,
+            48_000,
+            Box::new(move |samples: &[f32], _: u32| heard.send(samples.len()).unwrap()),
+            gate,
+        );
+        on_data(&[0.5]);
+        assert!(pieces.try_recv().is_err());
+        handed_over.store(true, Ordering::SeqCst);
+        on_data(&[0.5]);
+        assert_eq!(pieces.try_recv().unwrap(), 1);
     }
 
     #[test]

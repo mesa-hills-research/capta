@@ -57,15 +57,44 @@ has it. Packets longer than 16 MiB, replies to requests Capta didn't send
 and audio in shared memory are protocol errors. A sample cut between two packets waits for the
 rest.
 
-## Threads and blocking
+## Startup lifecycle
 
-`open` and `devices` have 3 s from the start for everything, the connection, every request
-and every reply, however the server spreads its bytes. On a desktop opening takes tens to
-hundreds of milliseconds, so call it off a UI thread and off an async runtime's workers.
+`devices` and `open` are startups, and both backends run them by the same four rules. On a
+desktop a startup takes tens to hundreds of milliseconds, so call it off a UI thread and off an
+async runtime's workers.
 
-std can't connect a Unix socket with a timeout, so a short-lived thread connects while `open`
-waits. If a server never accepts, that thread stays blocked and `open` gives up at the
-deadline. Once four such threads wait, opening fails at once rather than start more.
+### Deadline
+
+A startup has 3 s from the moment the public call begins, for everything it does. On Linux
+that's connecting, and every request and reply, however the server spreads its bytes. Through cpal it's listing the devices, choosing a format, building the stream and
+starting it.
+
+### Admission
+
+Some of that work can block where std can't time it out, such as connecting a Unix socket or
+a stuck audio driver. That work runs on a startup
+thread. Before the thread starts, the startup takes one of four permits, and the thread holds
+it until it has finished and cleaned up, however it ends, a panic included. So at most four
+startups run blocking work at once in a process. A startup that finds all four taken waits for
+one until its deadline, then fails as `Stalled`.
+
+### Cancellation
+
+Before each phase, the startup thread checks the deadline and stops once it has passed. On
+Linux the phases are the connection attempts. Through cpal they're
+finding the device, choosing its format, building the stream and starting it. The phases that
+run on the caller's thread, the requests on Linux, check the deadline before every read or
+write, and a reply already buffered when the deadline passes is refused.
+
+### Acceptance
+
+A result counts only if the startup thread finishes before the deadline. The thread and the
+waiting caller settle that with one atomic step, so a result is either handed over or given
+up, never both. The startup thread disposes of a result that comes too late itself. It closes
+a late socket, or stops and drops a late cpal stream without calling back, and only then gives
+its permit back.
+
+## Recording
 
 Each capture has one thread, which owns the socket. The `Capture` handle shares only a stop
 flag and a clone of the socket with it, and Capta takes no locks. `on_audio` and `on_error`
@@ -78,7 +107,9 @@ or `on_error`, and none runs after it. Neither may wait for the thread that drop
 A drop from inside one of the capture's own callbacks skips the join.
 
 Only decoded samples count as audio. When none come for 5 s and the stream isn't suspended,
-the capture ends with `Stalled`, even while events or parts of a packet keep arriving.
+the capture ends with `Stalled`, even while events or parts of a packet keep arriving. The 5 s
+start again after each `on_audio` returns, so a slow callback doesn't count against the
+server.
 
 ## Errors
 
@@ -106,10 +137,9 @@ mixes the channels down to mono, and `on_audio` gets the rate it records at. cpa
 lives on a thread of the capture's own, since it isn't `Send` everywhere, and cpal calls
 `on_audio` on its audio thread.
 
-Opening has 3 s here too. A device still opening after that is left to its thread, which
-drops it once it opens, and once four are left like that, opening fails at once. When cpal
-reports an overrun, audio was lost, so the capture ends with `Overrun` before the next buffer
-reaches `on_audio`.
+Starting follows the lifecycle above, on the capture's thread, which gives its permit back once
+the stream is handed over or dropped. When cpal reports an overrun, audio was lost, so the
+capture ends with `Overrun` before the next buffer reaches `on_audio`.
 
 Cargo resolves dependencies for every platform at once, and only one package in a project may
 link ALSA. So a project that uses Capta can't also use a crate that links another version of

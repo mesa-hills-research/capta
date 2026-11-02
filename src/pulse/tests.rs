@@ -635,23 +635,53 @@ fn a_packet_cut_by_a_deadline_stays_buffered() {
 }
 
 #[test]
-fn work_that_misses_its_deadline_is_bounded() {
-    static WAITING: AtomicUsize = AtomicUsize::new(0);
-    let slow = || thread::sleep(Duration::from_millis(500));
-    let started = Instant::now();
-    for _ in 0..MAX_WAITING {
-        let deadline = Instant::now() + Duration::from_millis(20);
-        assert_eq!(finish_by(deadline, &WAITING, slow), Err(Late::Deadline));
-    }
-    assert!(started.elapsed() < Duration::from_millis(400));
-    let deadline = Instant::now() + Duration::from_secs(1);
-    assert_eq!(finish_by(deadline, &WAITING, slow), Err(Late::Crowded));
-    thread::sleep(Duration::from_millis(700));
-    assert_eq!(WAITING.load(Ordering::SeqCst), 0);
+fn a_buffered_reply_after_the_deadline_is_refused() {
+    let (socket, _peer) = UnixStream::pair().unwrap();
+    let mut body = Writer::default();
+    body.u32(command::REPLY).u32(0).u32(VERSION);
+    let mut buffer = (body.bytes.len() as u32).to_be_bytes().to_vec();
+    buffer.extend_from_slice(&CONTROL.to_be_bytes());
+    buffer.extend_from_slice(&[0; 12]);
+    buffer.extend_from_slice(&body.bytes);
+    let end = buffer.len();
+    let past = Instant::now() - Duration::from_secs(1);
+    let mut connection = Connection {
+        socket,
+        buffer,
+        start: 0,
+        end,
+        version: VERSION,
+        next_sequence: 0,
+        timeouts: QUICK,
+        deadline: past,
+    };
+    assert!(connection.read_packet(past).unwrap().is_none());
+    let soon = Instant::now() + Duration::from_millis(50);
     assert_eq!(
-        finish_by(Instant::now() + Duration::from_secs(1), &WAITING, || 7),
-        Ok(7)
+        connection.read_packet(soon).unwrap().unwrap().channel,
+        CONTROL
     );
+}
+
+#[test]
+fn a_late_socket_is_closed() {
+    static PERMITS: startup::Permits = startup::Permits::new();
+    let (socket, mut peer) = UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let (release, proceed) = mpsc::channel::<()>();
+    let deadline = Instant::now() + Duration::from_millis(30);
+    let result = startup::run(
+        "test",
+        deadline,
+        &PERMITS,
+        move |start: Start<UnixStream>| {
+            proceed.recv().unwrap();
+            let _ = start.finish(socket);
+        },
+    );
+    assert!(matches!(result, Err(Late::Deadline)));
+    release.send(()).unwrap();
+    assert_eq!(peer.read(&mut [0]).unwrap(), 0);
 }
 
 /// Sends audio until the client goes away.

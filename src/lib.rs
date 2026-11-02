@@ -23,6 +23,7 @@
 //! that blocks for seconds makes the sound server drop audio.
 
 mod error;
+mod startup;
 
 #[cfg(target_os = "linux")]
 mod pulse;
