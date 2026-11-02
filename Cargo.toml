@@ -1,0 +1,22 @@
+[package]
+name = "capta"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+description = "Microphone capture in pure Rust. On Linux it speaks the PulseAudio protocol that PulseAudio and PipeWire serve, with no C library."
+repository = "https://github.com/mesa-hills-research/capta"
+documentation = "https://docs.rs/capta"
+readme = "README.md"
+keywords = ["audio", "microphone", "recording", "pulseaudio", "pipewire"]
+categories = ["multimedia::audio"]
+
+# On Linux the crate uses only the standard library. Elsewhere it records through cpal.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+cpal = "0.18.2"
+
+# An independent encoder and decoder of the PulseAudio protocol, for the tests to check ours
+# against.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+pulseaudio = "=0.3.2"
+
