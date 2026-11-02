@@ -29,6 +29,9 @@ thread_local! {
 pub(crate) fn devices() -> Result<Vec<Device>, Error> {
     let deadline = std::time::Instant::now() + TIMEOUT;
     let listing = |start: Start<Result<Vec<Device>, Error>>| {
+        if start.is_over() {
+            return;
+        }
         let host = cpal::default_host();
         let default = host
             .default_input_device()
@@ -202,6 +205,9 @@ fn start_stream<T>(
     messages: mpsc::Sender<Message>,
 ) -> Result<(cpal::Stream, Device, u32), Error> {
     let over = || Error::new(ErrorKind::Stalled, "opening the device took too long");
+    if start.is_over() {
+        return Err(over());
+    }
     let host = cpal::default_host();
     let default = host.default_input_device();
     let default_id = default.as_ref().and_then(|device| device.id().ok());

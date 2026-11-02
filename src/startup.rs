@@ -76,15 +76,47 @@ pub(crate) enum Late {
     Failed,
 }
 
+/// A startup's outcome. It starts pending, and whichever of the startup thread and the waiting
+/// caller gets there first decides it, once.
+///
+/// | From | To | By | When |
+/// |---|---|---|---|
+/// | pending | handed over | the startup thread | it finishes before the deadline |
+/// | pending | given up | the startup thread | it finishes at or after the deadline |
+/// | pending | given up | the caller | its wait times out, or the thread ends without a result |
+///
+/// Handed over and given up are final. Each side acts on the outcome that holds after its
+/// attempt, its own or the other side's, and the caller waits for the result only once it's
+/// handed over.
+struct Outcome(AtomicU8);
+
 const PENDING: u8 = 0;
 const HANDED_OVER: u8 = 1;
 const GIVEN_UP: u8 = 2;
+
+impl Outcome {
+    /// Decides `to` if the outcome is still pending. Returns the final outcome, and whether
+    /// this call decided it.
+    fn decide(&self, to: u8) -> (u8, bool) {
+        match self
+            .0
+            .compare_exchange(PENDING, to, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => (to, true),
+            Err(earlier) => (earlier, false),
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == PENDING
+    }
+}
 
 /// The startup thread's side of a startup. Dropping it gives the permit back, so the thread
 /// keeps it until it has cleaned up whatever it didn't hand over.
 pub(crate) struct Start<T> {
     deadline: Instant,
-    state: Arc<AtomicU8>,
+    outcome: Arc<Outcome>,
     // Dropped before `result`, so a caller that sees the thread end sees the permit back.
     _permit: Permit,
     result: mpsc::SyncSender<T>,
@@ -93,7 +125,7 @@ pub(crate) struct Start<T> {
 impl<T> Start<T> {
     /// Whether the startup is over, so no further phase should begin.
     pub(crate) fn is_over(&self) -> bool {
-        Instant::now() >= self.deadline || self.state.load(Ordering::SeqCst) != PENDING
+        Instant::now() >= self.deadline || !self.outcome.is_pending()
     }
 
     /// The time left for the next phase.
@@ -102,21 +134,22 @@ impl<T> Start<T> {
         self.deadline.saturating_duration_since(Instant::now())
     }
 
-    /// Hands `result` to the caller if the deadline hasn't passed, else gives it back for the
-    /// startup thread to dispose of.
+    /// Hands `result` to the caller if the deadline hasn't passed and nothing was decided yet,
+    /// else gives it back for the startup thread to dispose of.
     pub(crate) fn finish(&self, result: T) -> Result<(), T> {
-        let handed_over = Instant::now() < self.deadline
-            && self
-                .state
-                .compare_exchange(PENDING, HANDED_OVER, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok();
-        if !handed_over {
-            self.state.store(GIVEN_UP, Ordering::SeqCst);
-            return Err(result);
+        let to = if Instant::now() < self.deadline {
+            HANDED_OVER
+        } else {
+            GIVEN_UP
+        };
+        match self.outcome.decide(to) {
+            (HANDED_OVER, true) => {
+                // The channel holds one value, so this never blocks.
+                let _ = self.result.send(result);
+                Ok(())
+            }
+            _ => Err(result),
         }
-        // The channel holds one value, so this never blocks.
-        let _ = self.result.send(result);
-        Ok(())
     }
 }
 
@@ -132,11 +165,11 @@ pub(crate) fn run<T: Send + 'static>(
     if Instant::now() >= deadline {
         return Err(Late::Deadline);
     }
-    let state = Arc::new(AtomicU8::new(PENDING));
+    let outcome = Arc::new(Outcome(AtomicU8::new(PENDING)));
     let (result, results) = mpsc::sync_channel(1);
     let start = Start {
         deadline,
-        state: Arc::clone(&state),
+        outcome: Arc::clone(&outcome),
         _permit: permit,
         result,
     };
@@ -146,22 +179,22 @@ pub(crate) fn run<T: Send + 'static>(
         .spawn(move || work(start))
         .map_err(|_| Late::Crowded)?;
     let received = match results.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Err(mpsc::RecvTimeoutError::Timeout)
-            if state
-                .compare_exchange(PENDING, GIVEN_UP, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok() =>
-        {
-            return Err(Late::Deadline);
-        }
-        // The thread finished in time and is handing its result over.
-        Err(mpsc::RecvTimeoutError::Timeout) => results.recv().map_err(|_| Late::Failed),
-        // A thread that saw the deadline pass stops without a result, and one that panicked
-        // before it fails.
-        Err(mpsc::RecvTimeoutError::Disconnected) if Instant::now() >= deadline => {
-            Err(Late::Deadline)
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(Late::Failed),
         Ok(received) => Ok(received),
+        Err(mpsc::RecvTimeoutError::Timeout) => match outcome.decide(GIVEN_UP) {
+            // Handed over before the deadline, and the value follows at once.
+            (HANDED_OVER, _) => results.recv().map_err(|_| Late::Failed),
+            // Given up, by this call or by the thread, which disposes of its result itself.
+            _ => Err(Late::Deadline),
+        },
+        // The thread ended without sending a result.
+        Err(mpsc::RecvTimeoutError::Disconnected) => match outcome.decide(GIVEN_UP) {
+            // It stopped for the deadline, or gave its result up.
+            (GIVEN_UP, decided_here) if !decided_here || Instant::now() >= deadline => {
+                Err(Late::Deadline)
+            }
+            // It panicked before the deadline, or between handing over and sending.
+            _ => Err(Late::Failed),
+        },
     };
     received.map(|received| (received, thread))
 }
@@ -322,5 +355,69 @@ mod tests {
         thread.join().unwrap();
         assert_eq!(value, 9);
         assert_eq!(PERMITS.taken(), 0);
+    }
+
+    #[test]
+    fn a_thread_that_gives_up_doesnt_make_the_caller_wait_for_its_cleanup() {
+        static PERMITS: Permits = Permits::new();
+        let mut waited = Vec::new();
+        for attempt in 0..32 {
+            let deadline = Instant::now() + Duration::from_millis(10);
+            let began = Instant::now();
+            let result = run("test", deadline, &PERMITS, move |start: Start<()>| {
+                while Instant::now() < deadline {
+                    std::hint::spin_loop();
+                }
+                assert_eq!(start.finish(()), Err(()));
+                // Stands in for a native stream that takes a while to drop.
+                std::thread::sleep(Duration::from_millis(50));
+                drop(start);
+            });
+            let elapsed = began.elapsed();
+            let result = result.map(|_| ());
+            if elapsed > Duration::from_millis(40) || result != Err(Late::Deadline) {
+                waited.push((attempt, elapsed, result));
+            }
+            while PERMITS.taken() != 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(waited.is_empty(), "the caller waited or failed: {waited:?}");
+    }
+
+    #[test]
+    fn an_in_time_handover_can_be_received_after_the_deadline() {
+        static PERMITS: Permits = Permits::new();
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let (value, thread) = run("test", deadline, &PERMITS, |start: Start<u8>| {
+            // A thread preempted between deciding the handover and sending.
+            assert!(Instant::now() < start.deadline);
+            assert_eq!(start.outcome.decide(HANDED_OVER), (HANDED_OVER, true));
+            std::thread::sleep(Duration::from_millis(80));
+            start.result.send(7).unwrap();
+        })
+        .unwrap();
+        thread.join().unwrap();
+        assert_eq!(value, 7);
+        assert!(Instant::now() > deadline);
+        assert_eq!(PERMITS.taken(), 0);
+    }
+
+    #[test]
+    fn a_decision_is_final() {
+        let outcome = Outcome(AtomicU8::new(PENDING));
+        assert_eq!(outcome.decide(GIVEN_UP), (GIVEN_UP, true));
+        assert_eq!(outcome.decide(HANDED_OVER), (GIVEN_UP, false));
+        assert_eq!(outcome.decide(GIVEN_UP), (GIVEN_UP, false));
+
+        static PERMITS: Permits = Permits::new();
+        let (value, thread) = run("test", soon(), &PERMITS, |start: Start<u8>| {
+            assert_eq!(start.finish(1), Ok(()));
+            assert_eq!(start.finish(2), Err(2));
+            assert_eq!(start.outcome.decide(GIVEN_UP), (HANDED_OVER, false));
+        })
+        .unwrap();
+        thread.join().unwrap();
+        assert_eq!(value, 1);
     }
 }

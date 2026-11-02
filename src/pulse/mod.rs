@@ -502,6 +502,9 @@ impl Connection {
         let paths = server.paths.clone();
         let cookies = server.cookies.clone();
         let connecting = move |start: Start<Connected>| {
+            if start.is_over() {
+                return;
+            }
             let cookie = discovery::read_cookie(&cookies);
             let mut refused = None;
             for path in &paths {
