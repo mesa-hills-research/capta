@@ -348,11 +348,11 @@ fn requests_read_as_the_reference_reads_them() {
         );
         assert_eq!(
             (stream.sample_spec.channels, stream.sample_spec.sample_rate),
-            (1, 48_000)
+            (1, 16_000)
         );
         assert_eq!((stream.source_index, stream.source_name), (None, None));
-        assert_eq!(stream.buffer_attr.max_length, 2 * 48_000 * 4);
-        assert_eq!(stream.buffer_attr.fragment_size, 480 * 4);
+        assert_eq!(stream.buffer_attr.max_length, 2 * 16_000 * 4);
+        assert_eq!(stream.buffer_attr.fragment_size, 160 * 4);
         assert!(stream.flags.adjust_latency && !stream.flags.start_corked);
         assert!(!stream.flags.fix_rate && !stream.flags.fix_channels && !stream.flags.no_move);
         assert_eq!(stream.cvolume, None);
@@ -361,7 +361,6 @@ fn requests_read_as_the_reference_reads_them() {
         peer.wait_for_close();
     });
     let options = Options {
-        sample_rate: 48_000,
         piece: Duration::from_millis(10),
         app_name: "Tester".into(),
         ..Options::default()
@@ -857,4 +856,115 @@ fn opening_has_one_deadline() {
     thread.join().unwrap();
     assert_eq!(error.kind(), ErrorKind::Stalled, "{error}");
     assert!(elapsed < QUICK.open * 3 / 2, "took {elapsed:?}");
+}
+#[test]
+fn empty_packets_are_refused() {
+    let (server, thread) = serve(|peer| {
+        peer.open();
+        for _ in 0..9 {
+            if !peer.try_send(0, &[]) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let (opened, heard) = open_fake(&server).unwrap();
+    let error = heard.errors.recv_timeout(QUICK.stall * 2);
+    drop(opened);
+    thread.join().unwrap();
+    assert_eq!(error.expect("an error").kind(), ErrorKind::Protocol);
+}
+
+#[test]
+fn a_changed_rate_is_refused() {
+    let (server, thread) = serve(|peer| {
+        peer.open();
+        peer.wait_for_close();
+    });
+    let options = Options {
+        sample_rate: 48_000,
+        ..Options::default()
+    };
+    let result = open_with(&server, &options, Box::new(|_, _| {}), Box::new(|_| {}));
+    let kind = result.as_ref().err().map(Error::kind);
+    drop(result);
+    thread.join().unwrap();
+    assert_eq!(kind, Some(ErrorKind::Protocol));
+}
+
+#[test]
+fn the_control_channel_is_refused_for_audio() {
+    let (server, thread) = serve(|peer| {
+        peer.log_in();
+        let (sequence, _) = peer.expect(command::GET_SOURCE_INFO);
+        peer.replay(fixture!("source-info-reply"), sequence);
+        let (sequence, _) = peer.expect(command::CREATE_RECORD_STREAM);
+        let mut reply = fixture!("create-record-stream-reply").to_vec();
+        reply[HEADER + 11..HEADER + 15].copy_from_slice(&CONTROL.to_be_bytes());
+        peer.replay(&reply, sequence);
+        peer.wait_for_close();
+    });
+    let result = open_fake(&server);
+    let kind = result.as_ref().err().map(Error::kind);
+    drop(result);
+    thread.join().unwrap();
+    assert_eq!(kind, Some(ErrorKind::Protocol));
+}
+
+/// Sends one sample in a packet with the given offset and flags, and returns what the
+/// capture heard.
+fn send_framed(
+    offset: u64,
+    flags: u32,
+) -> (Result<Vec<f32>, mpsc::RecvTimeoutError>, Option<Error>) {
+    let (server, thread) = serve(move |peer| {
+        peer.open();
+        let mut packet = 4u32.to_be_bytes().to_vec();
+        packet.extend_from_slice(&0u32.to_be_bytes());
+        packet.extend_from_slice(&offset.to_be_bytes());
+        packet.extend_from_slice(&flags.to_be_bytes());
+        packet.extend_from_slice(&0.5f32.to_le_bytes());
+        peer.socket.write_all(&packet).unwrap();
+        peer.wait_for_close();
+    });
+    let (opened, heard) = open_fake(&server).unwrap();
+    let audio = heard.audio.recv_timeout(QUICK.stall);
+    let error = heard.errors.recv_timeout(QUICK.stall).ok();
+    drop(opened);
+    thread.join().unwrap();
+    (audio, error)
+}
+
+#[test]
+fn audio_with_a_seek_is_refused() {
+    let (audio, error) = send_framed(4, 0);
+    assert!(audio.is_err(), "delivered {audio:?}");
+    assert_eq!(error.map(|error| error.kind()), Some(ErrorKind::Protocol));
+}
+
+#[test]
+fn shared_memory_frames_are_refused() {
+    for flags in [0x4000_0000, 0x8000_0000, 0xc000_0000, 0x2000_0000, 1] {
+        let (audio, error) = send_framed(0, flags);
+        assert!(audio.is_err(), "flags {flags:#x} delivered {audio:?}");
+        assert_eq!(
+            error.map(|error| error.kind()),
+            Some(ErrorKind::Protocol),
+            "flags {flags:#x}"
+        );
+    }
+}
+
+#[test]
+fn control_packets_with_flags_are_refused() {
+    let (server, thread) = serve(|peer| {
+        let (sequence, _) = peer.expect(command::AUTH);
+        let mut packet = fixture!("auth-reply").to_vec();
+        packet[HEADER + 6..HEADER + 10].copy_from_slice(&sequence.to_be_bytes());
+        packet[16..20].copy_from_slice(&0x4000_0000u32.to_be_bytes());
+        peer.socket.write_all(&packet).unwrap();
+    });
+    let error = open_fake(&server).err().unwrap();
+    thread.join().unwrap();
+    assert_eq!(error.kind(), ErrorKind::Protocol, "{error}");
 }

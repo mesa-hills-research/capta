@@ -35,8 +35,6 @@ const NO_INDEX: u32 = u32::MAX;
 const HEADER: usize = 20;
 /// The longest packet accepted, the servers' own limit.
 const MAX_PACKET: usize = 16 << 20;
-/// Marks a data packet whose audio is in shared memory, which this client doesn't offer.
-const FLAG_SHM_DATA: u32 = 0x8000_0000;
 
 const FLOAT32LE: u8 = 5;
 const POSITION_MONO: u8 = 0;
@@ -190,31 +188,14 @@ fn open_with(
             .bool(false); // passthrough
         },
     )?;
-    let mut reader = Reader::new(&reply);
-    let channel = reader.u32()?;
-    // The stream's index, the server's buffer and the packet size.
-    reader.skip_n(3)?;
-    let spec = reader.sample_spec()?;
-    reader.skip()?; // the channel map
-    let source_index = reader.u32()?;
-    let source_name = reader.string()?.unwrap_or_default();
-    let suspended = reader.bool()?;
-    if spec.format != FLOAT32LE || spec.channels != 1 || spec.rate == 0 {
-        return Err(Error::new(
-            ErrorKind::Protocol,
-            format!(
-                "the sound server offered format {} with {} channels at {} Hz instead of mono floats",
-                spec.format, spec.channels, spec.rate
-            ),
-        ));
-    }
-    let device = if source_index == source.index {
+    let stream = CreatedStream::read(&reply, rate)?;
+    let device = if stream.source_index == source.index {
         source.into_device(default.as_deref())
     } else {
         // The default changed between the two requests.
         Device {
-            id: source_name.clone(),
-            name: source_name,
+            id: stream.source_name.clone(),
+            name: stream.source_name,
             is_default: options.device.is_none(),
         }
     };
@@ -226,9 +207,9 @@ fn open_with(
     let stop = Arc::new(AtomicBool::new(false));
     let recording = Recording {
         connection,
-        channel,
-        rate: spec.rate,
-        suspended,
+        channel: stream.channel,
+        rate,
+        suspended: stream.suspended,
         stop: Arc::clone(&stop),
         on_audio,
     };
@@ -243,8 +224,62 @@ fn open_with(
             thread: Some(thread),
         },
         device,
-        sample_rate: spec.rate,
+        sample_rate: rate,
     })
+}
+
+/// What the server says about the stream it created.
+struct CreatedStream {
+    channel: u32,
+    source_index: u32,
+    source_name: String,
+    suspended: bool,
+}
+
+impl CreatedStream {
+    /// Reads the reply, and refuses a stream other than the one asked for.
+    fn read(reply: &[u8], rate: u32) -> Result<CreatedStream, Error> {
+        let mut reader = Reader::new(reply);
+        let channel = reader.u32()?;
+        let stream_index = reader.u32()?;
+        // The server's buffer and the packet size.
+        reader.skip_n(2)?;
+        let spec = reader.sample_spec()?;
+        let positions = reader.channel_map()?;
+        let source_index = reader.u32()?;
+        let source_name = reader.string()?;
+        let suspended = reader.bool()?;
+        let wanted = SampleSpec {
+            format: FLOAT32LE,
+            channels: 1,
+            rate,
+        };
+        if spec != wanted || positions != [POSITION_MONO] {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                format!(
+                    "the sound server offered format {} with {} channels at {} Hz instead of mono floats at {rate} Hz",
+                    spec.format, spec.channels, spec.rate
+                ),
+            ));
+        }
+        match source_name {
+            Some(source_name)
+                if channel != CONTROL && stream_index != NO_INDEX && source_index != NO_INDEX =>
+            {
+                Ok(CreatedStream {
+                    channel,
+                    source_index,
+                    source_name,
+                    suspended,
+                })
+            }
+            _ => Err(Error::new(
+                ErrorKind::Protocol,
+                "the sound server described the stream it created with an invalid channel or source",
+            )),
+        }
+    }
 }
 
 /// A running capture's handle.
@@ -307,12 +342,6 @@ impl Recording {
             match packet? {
                 None => {}
                 Some(packet) if packet.channel == self.channel => {
-                    if packet.flags & FLAG_SHM_DATA != 0 {
-                        return Err(Error::new(
-                            ErrorKind::Protocol,
-                            "the sound server sent audio in shared memory, which wasn't offered",
-                        ));
-                    }
                     decode(packet.body, &mut partial, &mut samples);
                     if !samples.is_empty() {
                         audio_due = Instant::now() + stall;
@@ -444,10 +473,9 @@ impl Source {
     }
 }
 
-/// A packet as it came from the server.
+/// A packet as it came from the server, in the subset this client reads.
 struct Packet<'a> {
     channel: u32,
-    flags: u32,
     body: &'a [u8],
 }
 
@@ -665,23 +693,14 @@ impl Connection {
     }
 
     /// The next packet, or `None` when `deadline` passes first. A packet the deadline cuts
-    /// stays buffered for the next call.
+    /// stays buffered for the next call. Each header is checked as soon as it's read.
     fn read_packet(&mut self, deadline: Instant) -> Result<Option<Packet<'_>>, Error> {
         let length = loop {
             let buffered = self.end - self.start;
             let needed = if buffered < HEADER {
                 HEADER
             } else {
-                let length = be_u32(&self.buffer[self.start..]) as usize;
-                if length > MAX_PACKET {
-                    return Err(Error::new(
-                        ErrorKind::Protocol,
-                        format!(
-                            "the sound server sent a packet of {length} bytes, more than the {MAX_PACKET} allowed"
-                        ),
-                    ));
-                }
-                HEADER + length
+                HEADER + check_header(&self.buffer[self.start..self.start + HEADER])?
             };
             if buffered >= needed {
                 break needed;
@@ -728,10 +747,39 @@ impl Connection {
         }
         Ok(Some(Packet {
             channel: be_u32(&packet[4..]),
-            flags: be_u32(&packet[16..]),
             body: &packet[HEADER..],
         }))
     }
+}
+
+/// Checks a packet's header against the subset this client reads, and returns the length of
+/// the body. Every packet has a body and no flags, since shared memory isn't offered and the
+/// only seek a record stream uses is none, so audio also has no offset.
+fn check_header(header: &[u8]) -> Result<usize, Error> {
+    let length = be_u32(header) as usize;
+    let channel = be_u32(&header[4..]);
+    let offset = &header[8..16];
+    let flags = be_u32(&header[16..]);
+    let refuse = |detail: String| Err(Error::new(ErrorKind::Protocol, detail));
+    if length == 0 {
+        return refuse("the sound server sent an empty packet".into());
+    }
+    if length > MAX_PACKET {
+        return refuse(format!(
+            "the sound server sent a packet of {length} bytes, more than the {MAX_PACKET} allowed"
+        ));
+    }
+    if flags != 0 {
+        return refuse(format!(
+            "the sound server sent a packet with flags {flags:#x}, as for shared memory or seeking, which this client doesn't use"
+        ));
+    }
+    if channel != CONTROL && offset != [0; 8] {
+        return refuse(
+            "the sound server sent audio that seeks, which this client doesn't use".into(),
+        );
+    }
+    Ok(length)
 }
 
 /// Why work on a helper thread didn't come back.
