@@ -6,6 +6,8 @@
 
 mod discovery;
 mod tagstruct;
+#[cfg(test)]
+mod tests;
 
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
