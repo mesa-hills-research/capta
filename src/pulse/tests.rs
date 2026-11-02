@@ -25,7 +25,7 @@ macro_rules! fixture {
 
 const MICROPHONE: &str = "alsa_input.pci-0000_02_02.0.analog-stereo";
 const QUICK: Timeouts = Timeouts {
-    request: Duration::from_millis(300),
+    open: Duration::from_millis(300),
     stall: Duration::from_millis(300),
 };
 const LONG: Duration = Duration::from_secs(3);
@@ -46,9 +46,20 @@ fn serve(script: impl FnOnce(&mut Peer) + Send + 'static) -> (Server, JoinHandle
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("native");
     let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
     let thread = thread::spawn(move || {
-        let (socket, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        let accepted = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break Some(socket),
+                Err(_) if started.elapsed() < LONG => thread::sleep(Duration::from_millis(5)),
+                Err(_) => break None,
+            }
+        };
         std::fs::remove_dir_all(&dir).unwrap();
+        // A client that never connects has failed already, and its test says why.
+        let Some(socket) = accepted else { return };
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
@@ -595,11 +606,8 @@ fn an_oversized_packet_is_refused() {
 }
 
 #[test]
-fn a_packet_cut_by_a_timeout_stays_buffered() {
+fn a_packet_cut_by_a_deadline_stays_buffered() {
     let (socket, mut peer) = UnixStream::pair().unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .unwrap();
     let mut connection = Connection {
         socket,
         buffer: vec![0; 16],
@@ -608,21 +616,43 @@ fn a_packet_cut_by_a_timeout_stays_buffered() {
         version: VERSION,
         next_sequence: 0,
         timeouts: QUICK,
+        deadline: Instant::now(),
     };
+    let soon = || Instant::now() + Duration::from_millis(50);
     let mut packet = 40u32.to_be_bytes().to_vec();
     packet.extend_from_slice(&7u32.to_be_bytes());
     packet.extend_from_slice(&[0; 12]);
     packet.extend((0..40).map(|n| n as u8));
     peer.write_all(&packet[..30]).unwrap();
-    assert!(connection.read_packet().unwrap().is_none());
+    assert!(connection.read_packet(soon()).unwrap().is_none());
     peer.write_all(&packet[30..]).unwrap();
     peer.write_all(&packet).unwrap();
     for _ in 0..2 {
-        let read = connection.read_packet().unwrap().unwrap();
+        let read = connection.read_packet(soon()).unwrap().unwrap();
         assert_eq!(read.channel, 7);
         assert_eq!(read.body, &packet[HEADER..]);
     }
-    assert!(connection.read_packet().unwrap().is_none());
+    assert!(connection.read_packet(soon()).unwrap().is_none());
+}
+
+#[test]
+fn work_that_misses_its_deadline_is_bounded() {
+    static WAITING: AtomicUsize = AtomicUsize::new(0);
+    let slow = || thread::sleep(Duration::from_millis(500));
+    let started = Instant::now();
+    for _ in 0..MAX_WAITING {
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert_eq!(finish_by(deadline, &WAITING, slow), Err(Late::Deadline));
+    }
+    assert!(started.elapsed() < Duration::from_millis(400));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    assert_eq!(finish_by(deadline, &WAITING, slow), Err(Late::Crowded));
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(WAITING.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        finish_by(Instant::now() + Duration::from_secs(1), &WAITING, || 7),
+        Ok(7)
+    );
 }
 
 /// Sends audio until the client goes away.
@@ -729,4 +759,102 @@ fn a_missing_socket_is_no_server() {
 fn a_capture_can_move_between_threads() {
     fn assert_send<T: Send>() {}
     assert_send::<crate::Capture>();
+}
+
+/// Sends the header of a 100-byte packet on `channel`, then one byte every 100 ms.
+fn trickle(peer: &mut Peer, channel: u32) {
+    let mut header = 100u32.to_be_bytes().to_vec();
+    header.extend_from_slice(&channel.to_be_bytes());
+    header.extend_from_slice(&[0; 12]);
+    peer.socket.write_all(&header).unwrap();
+    for _ in 0..9 {
+        thread::sleep(Duration::from_millis(100));
+        if peer.socket.write_all(&[0]).is_err() {
+            break;
+        }
+    }
+}
+
+#[test]
+fn a_reply_trickled_past_the_deadline_times_out() {
+    let (server, thread) = serve(|peer| {
+        peer.expect(command::AUTH);
+        trickle(peer, CONTROL);
+    });
+    let started = Instant::now();
+    let error = open_fake(&server).err().unwrap();
+    let elapsed = started.elapsed();
+    thread.join().unwrap();
+    assert_eq!(error.kind(), ErrorKind::Stalled, "{error}");
+    assert!(elapsed < QUICK.open * 2, "took {elapsed:?}");
+}
+
+#[test]
+fn audio_trickled_past_the_stall_allowance_stalls() {
+    let (server, thread) = serve(|peer| {
+        peer.open();
+        trickle(peer, 0);
+    });
+    let (opened, heard) = open_fake(&server).unwrap();
+    let error = heard.errors.recv_timeout(QUICK.stall * 2);
+    drop(opened);
+    thread.join().unwrap();
+    assert_eq!(error.expect("a stall").kind(), ErrorKind::Stalled);
+}
+
+#[test]
+fn moves_without_audio_still_stall() {
+    let (server, thread) = serve(|peer| {
+        peer.open();
+        for _ in 0..9 {
+            let mut w = Writer::default();
+            w.u32(command::RECORD_STREAM_MOVED).u32(u32::MAX);
+            w.u32(0).u32(60).string(Some("mic")).bool(false);
+            if !peer.try_send(CONTROL, &w.bytes) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let (opened, heard) = open_fake(&server).unwrap();
+    let error = heard.errors.recv_timeout(QUICK.stall * 2);
+    drop(opened);
+    thread.join().unwrap();
+    assert_eq!(error.expect("a stall").kind(), ErrorKind::Stalled);
+}
+
+#[test]
+fn opening_has_one_deadline() {
+    let (server, thread) = serve(|peer| {
+        for command in [
+            command::AUTH,
+            command::SET_CLIENT_NAME,
+            command::GET_SERVER_INFO,
+        ] {
+            let mut header = [0; HEADER];
+            if peer.socket.read_exact(&mut header).is_err() {
+                return;
+            }
+            let mut body = vec![0; be_u32(&header) as usize];
+            peer.socket.read_exact(&mut body).unwrap();
+            let sequence = Reader::new(&body[5..]).u32().unwrap();
+            thread::sleep(QUICK.open * 2 / 3);
+            let recorded = match command {
+                command::AUTH => fixture!("auth-reply"),
+                command::SET_CLIENT_NAME => fixture!("client-name-reply"),
+                _ => fixture!("server-info-reply"),
+            };
+            let mut packet = recorded.to_vec();
+            packet[HEADER + 6..HEADER + 10].copy_from_slice(&sequence.to_be_bytes());
+            if peer.socket.write_all(&packet).is_err() {
+                return;
+            }
+        }
+    });
+    let started = Instant::now();
+    let error = devices_with(&server, "Tester").unwrap_err();
+    let elapsed = started.elapsed();
+    thread.join().unwrap();
+    assert_eq!(error.kind(), ErrorKind::Stalled, "{error}");
+    assert!(elapsed < QUICK.open * 3 / 2, "took {elapsed:?}");
 }

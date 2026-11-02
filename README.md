@@ -29,8 +29,8 @@ let capture = capta::open(
 ```
 
 The default options record the default device at 16 kHz. `capta::devices()` lists the input
-devices, and `Options::device` picks one by its id. `open` blocks until the recording runs, a few
-hundred milliseconds at most, so call it off a UI thread.
+devices, and `Options::device` picks one by its id. `open` blocks until the recording runs,
+usually for tens to hundreds of milliseconds, and gives up after 3 s, so call it off a UI thread.
 
 The example records into a WAV file.
 

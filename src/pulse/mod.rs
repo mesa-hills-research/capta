@@ -13,8 +13,8 @@ use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -60,8 +60,8 @@ mod command {
 /// How long to wait for the sound server.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Timeouts {
-    /// For each reply while opening.
-    pub request: Duration,
+    /// For the whole of opening or listing, from the connection to the last reply.
+    pub open: Duration,
     /// For audio while recording, unless the server suspended the stream.
     pub stall: Duration,
 }
@@ -69,11 +69,17 @@ pub(crate) struct Timeouts {
 impl Default for Timeouts {
     fn default() -> Self {
         Timeouts {
-            request: Duration::from_secs(3),
+            open: Duration::from_secs(3),
             stall: Duration::from_secs(5),
         }
     }
 }
+
+/// Connections that missed their deadline and still wait in a thread of their own, behind a
+/// server that doesn't accept them.
+static WAITING_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+/// How many connections may wait like that before opening fails at once.
+const MAX_WAITING: usize = 4;
 
 /// Where the sound server may listen, and what to show it.
 pub(crate) struct Server {
@@ -213,13 +219,10 @@ fn open_with(
         }
     };
 
-    let stall = connection.timeouts.stall;
-    let setup = |error| io_failure(error, "setting up the recording");
-    connection
+    let socket = connection
         .socket
-        .set_read_timeout(Some(stall))
-        .map_err(setup)?;
-    let socket = connection.socket.try_clone().map_err(setup)?;
+        .try_clone()
+        .map_err(|error| io_failure(error, "setting up the recording"))?;
     let stop = Arc::new(AtomicBool::new(false));
     let recording = Recording {
         connection,
@@ -283,13 +286,21 @@ impl Recording {
         }
     }
 
-    /// Hands audio to `on_audio` until the capture stops, or returns why it failed.
+    /// Hands audio to `on_audio` until the capture stops, or returns why it failed. Only
+    /// decoded samples count as progress, and the stall allowance waits while the server has
+    /// the stream suspended.
     fn receive(&mut self) -> Result<(), Error> {
+        let stall = self.connection.timeouts.stall;
         let mut samples = Vec::new();
         let mut partial = Vec::with_capacity(4);
-        let mut last_audio = Instant::now();
+        let mut audio_due = Instant::now() + stall;
         loop {
-            let packet = self.connection.read_packet();
+            let read_by = if self.suspended {
+                Instant::now() + stall
+            } else {
+                audio_due
+            };
+            let packet = self.connection.read_packet(read_by);
             if self.stop.load(Ordering::SeqCst) {
                 return Ok(());
             }
@@ -303,27 +314,29 @@ impl Recording {
                         ));
                     }
                     decode(packet.body, &mut partial, &mut samples);
-                    last_audio = Instant::now();
                     if !samples.is_empty() {
+                        audio_due = Instant::now() + stall;
                         (self.on_audio)(&samples, self.rate);
                         samples.clear();
                     }
                 }
                 Some(packet) if packet.channel == CONTROL => {
-                    if let Some(suspended) = event(packet.body, self.channel)? {
+                    if let Some(suspended) = event(packet.body, self.channel)?
+                        && suspended != self.suspended
+                    {
                         self.suspended = suspended;
-                        last_audio = Instant::now();
+                        audio_due = Instant::now() + stall;
                     }
                 }
                 // Audio of a stream this client didn't open.
                 Some(_) => {}
             }
-            if !self.suspended && last_audio.elapsed() >= self.connection.timeouts.stall {
+            if !self.suspended && Instant::now() >= audio_due {
                 return Err(Error::new(
                     ErrorKind::Stalled,
                     format!(
                         "the sound server sent no audio for {:.1} s",
-                        self.connection.timeouts.stall.as_secs_f32()
+                        stall.as_secs_f32()
                     ),
                 ));
             }
@@ -448,19 +461,43 @@ struct Connection {
     version: u32,
     next_sequence: u32,
     timeouts: Timeouts,
+    /// When opening or listing must be done.
+    deadline: Instant,
 }
 
 impl Connection {
-    /// Connects to the first server that answers and logs in.
+    /// Connects to the first server that answers and logs in, all within the time allowed
+    /// for opening.
     fn connect(server: &Server, app_name: &str) -> Result<Connection, Error> {
+        let deadline = Instant::now() + server.timeouts.open;
         let mut refused = None;
         for path in &server.paths {
-            match UnixStream::connect(path) {
-                Ok(socket) => return Connection::log_in(socket, server, app_name),
-                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let connecting = {
+                let path = path.clone();
+                move || UnixStream::connect(path)
+            };
+            match finish_by(deadline, &WAITING_CONNECTIONS, connecting) {
+                Ok(Ok(socket)) => return Connection::log_in(socket, server, app_name, deadline),
+                Ok(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied => {
                     refused = Some(path)
                 }
-                Err(_) => {}
+                Ok(Err(_)) => {}
+                Err(Late::Deadline) => {
+                    return Err(Error::new(
+                        ErrorKind::Stalled,
+                        format!(
+                            "the sound server at {} didn't accept the connection within {:.1} s",
+                            path.display(),
+                            server.timeouts.open.as_secs_f32()
+                        ),
+                    ));
+                }
+                Err(Late::Crowded) => {
+                    return Err(Error::new(
+                        ErrorKind::Stalled,
+                        "earlier connections to the sound server are still waiting",
+                    ));
+                }
             }
         }
         Err(match refused {
@@ -475,14 +512,12 @@ impl Connection {
         })
     }
 
-    fn log_in(socket: UnixStream, server: &Server, app_name: &str) -> Result<Connection, Error> {
-        let setup = |error| io_failure(error, "setting up the connection");
-        socket
-            .set_read_timeout(Some(server.timeouts.request))
-            .map_err(setup)?;
-        socket
-            .set_write_timeout(Some(server.timeouts.request))
-            .map_err(setup)?;
+    fn log_in(
+        socket: UnixStream,
+        server: &Server,
+        app_name: &str,
+        deadline: Instant,
+    ) -> Result<Connection, Error> {
         let mut connection = Connection {
             socket,
             buffer: vec![0; 64 << 10],
@@ -491,6 +526,7 @@ impl Connection {
             version: VERSION,
             next_sequence: 0,
             timeouts: server.timeouts,
+            deadline,
         };
         let reply = connection.request(command::AUTH, "the login", |w| {
             // The version, with the flags for shared memory and memfd left clear.
@@ -546,7 +582,7 @@ impl Connection {
     }
 
     /// Sends a command and waits for its reply, which it returns without the header. Events
-    /// that come first are passed over.
+    /// that come first are passed over. Both must be done by the connection's deadline.
     fn request(
         &mut self,
         command: u32,
@@ -564,28 +600,11 @@ impl Connection {
         let length = u32::try_from(packet.len() - HEADER).expect("requests are small");
         packet[..4].copy_from_slice(&length.to_be_bytes());
         packet[4..8].copy_from_slice(&CONTROL.to_be_bytes());
-        // The whole packet in one write, so a server that reads credentials gets them with it.
-        self.socket
-            .write_all(&packet)
-            .map_err(|error| io_failure(error, "sending to the sound server"))?;
+        self.send(&packet, what)?;
 
-        let deadline = Instant::now() + self.timeouts.request;
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::new(
-                    ErrorKind::Stalled,
-                    format!(
-                        "the sound server didn't answer {what} within {:.1} s",
-                        self.timeouts.request.as_secs_f32()
-                    ),
-                ));
-            }
-            self.socket
-                .set_read_timeout(Some(remaining))
-                .map_err(|error| io_failure(error, "setting up the connection"))?;
-            let Some(packet) = self.read_packet()? else {
-                continue;
+            let Some(packet) = self.read_packet(self.deadline)? else {
+                return Err(self.late(what));
             };
             if packet.channel != CONTROL {
                 continue;
@@ -608,9 +627,46 @@ impl Connection {
         }
     }
 
-    /// The next packet, or `None` when the read timeout passes first. A packet the timeout
-    /// cuts stays buffered for the next call.
-    fn read_packet(&mut self) -> Result<Option<Packet<'_>>, Error> {
+    /// Writes a whole packet by the connection's deadline. A small one goes in one write, so
+    /// a server that reads credentials gets them with it.
+    fn send(&mut self, mut bytes: &[u8], what: &str) -> Result<(), Error> {
+        while !bytes.is_empty() {
+            let remaining = self.deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(self.late(what));
+            }
+            self.socket
+                .set_write_timeout(Some(remaining))
+                .map_err(|error| io_failure(error, "sending to the sound server"))?;
+            match self.socket.write(bytes) {
+                Ok(0) => return Err(io_failure(io::ErrorKind::WriteZero.into(), "sending")),
+                Ok(written) => bytes = &bytes[written..],
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => return Err(io_failure(error, "sending to the sound server")),
+            }
+        }
+        Ok(())
+    }
+
+    fn late(&self, what: &str) -> Error {
+        Error::new(
+            ErrorKind::Stalled,
+            format!(
+                "the sound server didn't answer {what} within the {:.1} s allowed",
+                self.timeouts.open.as_secs_f32()
+            ),
+        )
+    }
+
+    /// The next packet, or `None` when `deadline` passes first. A packet the deadline cuts
+    /// stays buffered for the next call.
+    fn read_packet(&mut self, deadline: Instant) -> Result<Option<Packet<'_>>, Error> {
         let length = loop {
             let buffered = self.end - self.start;
             let needed = if buffered < HEADER {
@@ -638,6 +694,13 @@ impl Connection {
                     self.buffer.resize(needed, 0);
                 }
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            self.socket
+                .set_read_timeout(Some(remaining))
+                .map_err(|error| io_failure(error, "reading from the sound server"))?;
             match self.socket.read(&mut self.buffer[self.end..]) {
                 Ok(0) => {
                     return Err(Error::new(
@@ -669,6 +732,62 @@ impl Connection {
             body: &packet[HEADER..],
         }))
     }
+}
+
+/// Why work on a helper thread didn't come back.
+#[derive(Debug, PartialEq)]
+enum Late {
+    /// It missed the deadline.
+    Deadline,
+    /// Too many earlier ones still wait, or no thread could start.
+    Crowded,
+}
+
+/// Runs `work` on a thread of its own and waits for it until `deadline`, for blocking calls
+/// that std can't time out, such as connecting. Work that misses the deadline finishes by
+/// itself later, and `waiting` counts it until then. Once [`MAX_WAITING`] wait behind a
+/// server that never answers, calls fail at once rather than start more threads.
+fn finish_by<T: Send + 'static>(
+    deadline: Instant,
+    waiting: &'static AtomicUsize,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Late> {
+    const RUNNING: u8 = 0;
+    const DONE: u8 = 1;
+    const ABANDONED: u8 = 2;
+    if waiting.load(Ordering::SeqCst) >= MAX_WAITING {
+        return Err(Late::Crowded);
+    }
+    let state = Arc::new(AtomicU8::new(RUNNING));
+    let (sender, done) = mpsc::sync_channel(1);
+    let helper_state = Arc::clone(&state);
+    let spawned = std::thread::Builder::new()
+        .name("capta-connect".into())
+        .spawn(move || {
+            let _ = sender.send(work());
+            if helper_state
+                .compare_exchange(RUNNING, DONE, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                waiting.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+    if spawned.is_err() {
+        return Err(Late::Crowded);
+    }
+    if let Ok(result) = done.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        return Ok(result);
+    }
+    waiting.fetch_add(1, Ordering::SeqCst);
+    if state
+        .compare_exchange(RUNNING, ABANDONED, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        return Err(Late::Deadline);
+    }
+    // The work finished just after the deadline, and its result is waiting.
+    waiting.fetch_sub(1, Ordering::SeqCst);
+    done.try_recv().map_err(|_| Late::Deadline)
 }
 
 fn be_u32(bytes: &[u8]) -> u32 {

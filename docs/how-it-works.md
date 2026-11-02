@@ -48,8 +48,8 @@ While recording, the server's events change what Capta does.
 | Event | Effect |
 |---|---|
 | `RECORD_STREAM_KILLED` | The capture ends with `Disconnected` |
-| `RECORD_STREAM_SUSPENDED` | The stall timer waits while the stream is suspended |
-| `RECORD_STREAM_MOVED` | Recording goes on, from the new source |
+| `RECORD_STREAM_SUSPENDED` | The stall allowance waits while the stream is suspended, and starts again when it resumes |
+| `RECORD_STREAM_MOVED` | Recording goes on from the new source, which may be suspended |
 
 Every value in the protocol carries a type byte, so the reader skips the fields it doesn't need
 whatever their values. A field added after version 22 is read only when the negotiated version
@@ -59,20 +59,26 @@ rest.
 
 ## Threads and blocking
 
-`open` blocks for the connection, the login and the stream, each reply bounded by 3 s. On a
-desktop it takes tens to hundreds of milliseconds, so call it off a UI thread and off an async
-runtime's workers.
+`open` and `devices` have 3 s from the start for everything, the connection, every request
+and every reply, however the server spreads its bytes. On a desktop opening takes tens to
+hundreds of milliseconds, so call it off a UI thread and off an async runtime's workers.
+
+std can't connect a Unix socket with a timeout, so a short-lived thread connects while `open`
+waits. If a server never accepts, that thread stays blocked and `open` gives up at the
+deadline. Once four such threads wait, opening fails at once rather than start more.
 
 Each capture has one thread, which owns the socket. The `Capture` handle shares only a stop
-flag and a clone of the socket with it, and Capta takes no locks. `on_audio` runs on that thread.
-It should hand the samples on and return, because the server drops audio once its 2 s buffer
-fills.
+flag and a clone of the socket with it, and Capta takes no locks. `on_audio` and `on_error`
+run on that thread. `on_audio` should hand the samples on and return, because the server drops
+audio once its 2 s buffer fills.
 
 Dropping the `Capture` sets the flag, shuts the socket down, which wakes the thread's read at
-once, and joins the thread. So the drop waits for at most one call of `on_audio` in progress,
-and none runs after it. A drop from inside a callback skips the join.
+once, and joins the thread. So the drop waits for at most one callback in progress, `on_audio`
+or `on_error`, and none runs after it. Neither may wait for the thread that drops the capture.
+A drop from inside one of the capture's own callbacks skips the join.
 
-When no audio comes for 5 s and the stream isn't suspended, the capture ends with `Stalled`.
+Only decoded samples count as audio. When none come for 5 s and the stream isn't suspended,
+the capture ends with `Stalled`, even while events or parts of a packet keep arriving.
 
 ## Errors
 
@@ -86,7 +92,7 @@ lowercase detail for logs.
 | `Busy` | Another program has the device |
 | `PermissionDenied` | The server refused the login, the socket refused this user, or the system refused access to the microphone |
 | `Disconnected` | The server closed the connection or ended the stream |
-| `Stalled` | The server didn't answer within 3 s, or sent no audio for 5 s |
+| `Stalled` | Opening took more than 3 s, or the server sent no audio for 5 s |
 | `Protocol` | The server sent something Capta can't read |
 | `Unsupported` | A rate, piece length, network server or protocol version Capta doesn't support |
 | `Io` | The operating system failed a call |

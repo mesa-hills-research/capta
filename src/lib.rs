@@ -90,20 +90,21 @@ pub(crate) type OnAudio = Box<dyn FnMut(&[f32], u32) + Send>;
 /// What hears that a running capture stopped, and why.
 pub(crate) type OnError = Box<dyn FnOnce(Error) + Send>;
 
-/// The input devices, without the monitors of outputs. Blocks for a round trip to the sound
-/// server, so call it off a UI thread.
+/// The input devices, without the monitors of outputs. Blocks for a few round trips to the
+/// sound server and gives up after 3 s, so call it off a UI thread.
 pub fn devices() -> Result<Vec<Device>, Error> {
     backend::devices()
 }
 
 /// Starts recording.
 ///
-/// It blocks until the recording runs or fails, which takes a few hundred milliseconds at
-/// most when the sound server answers and gives up after 3 s when it doesn't. So call it off
-/// a UI thread and off an async runtime's workers.
+/// It blocks until the recording runs or fails. That usually takes tens to hundreds of
+/// milliseconds, and it gives up 3 s after it starts. So call it off a UI thread and off an
+/// async runtime's workers.
 ///
 /// `on_audio` and `on_error` run on a thread of the capture's own. `on_error` runs at most
-/// once, when a running capture stops, and `on_audio` never runs after it.
+/// once, when a running capture stops, and `on_audio` never runs after it. On Linux a capture
+/// fails as `Stalled` when no audio comes for 5 s while the stream isn't suspended.
 pub fn open(
     options: &Options,
     on_audio: impl FnMut(&[f32], u32) + Send + 'static,
@@ -131,9 +132,10 @@ pub fn open(
 
 /// A recording, until dropped.
 ///
-/// Dropping it stops the recording and waits for a call of `on_audio` in progress to return,
-/// so none runs after the drop. A callback must not wait for the thread that drops the
-/// capture. A drop from inside a callback returns at once.
+/// Dropping it stops the recording and waits for a callback in progress, `on_audio` or
+/// `on_error`, to return, so none runs after the drop. So neither callback may wait for the
+/// thread that drops the capture. Dropping a capture from inside one of its own callbacks
+/// returns at once.
 pub struct Capture {
     device: Device,
     sample_rate: u32,
