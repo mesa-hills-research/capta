@@ -20,3 +20,6 @@ cpal = "0.18.2"
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pulseaudio = "=0.3.2"
 
+[[example]]
+name = "capta-record"
+path = "examples/capta-record.rs"
