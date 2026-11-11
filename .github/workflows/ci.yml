@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # No audio device yet, so this also covers listing and opening without one.
+      - name: Test
+        run: cargo test
+
+      # macOS runners come with two input devices of their own.
+      - name: Open the microphone without one
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          cargo run --example capta-record -- --list || true
+          ! cargo run --example capta-record -- "$RUNNER_TEMP/none.wav" 1
+
+      - name: Make a 440 Hz tone
+        shell: bash
+        run: |
+          PYTHON=$(command -v python3 || command -v python)
+          "$PYTHON" - "$RUNNER_TEMP/tone.wav" <<'EOF'
+          import math, struct, sys, wave
+          rate = 48000
+          frames = bytearray()
+          for i in range(rate * 20):
+              value = int(0.5 * 32767 * math.sin(2 * math.pi * 440 * i / rate))
+              frames += struct.pack("<hh", value, value)
+          with wave.open(sys.argv[1], "wb") as out:
+              out.setnchannels(2)
+              out.setsampwidth(2)
+              out.setframerate(rate)
+              out.writeframes(bytes(frames))
+          EOF
+
+      - name: Add a loopback microphone (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pulseaudio pulseaudio-utils
+          pulseaudio -D --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=loop
+          pactl load-module module-remap-source master=loop.monitor source_name=mic
+          pactl set-default-sink loop
+          pactl set-default-source mic
+          pactl list short sources
+
+      - name: Add a loopback microphone (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install switchaudio-osx blackhole-2ch
+          sudo killall -9 coreaudiod || true
+          sleep 5
+          SwitchAudioSource -a
+          SwitchAudioSource -t input -s "BlackHole 2ch"
+          SwitchAudioSource -t output -s "BlackHole 2ch"
+          # Let processes the runner starts use the microphone.
+          DB="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+          sqlite3 "$DB" "INSERT OR IGNORE INTO access VALUES ('kTCCServiceMicrophone','/usr/local/opt/runner/provisioner/provisioner',1,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,1687786159,NULL,NULL,'UNUSED',1687786159);" \
+            || sqlite3 "$DB" "INSERT OR IGNORE INTO access VALUES ('kTCCServiceMicrophone','/usr/local/opt/runner/provisioner/provisioner',1,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,1687786159);"
+
+      - name: Add a loopback microphone (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($service in @("AudioEndpointBuilder", "Audiosrv")) {
+            Set-Service -Name $service -StartupType Automatic
+            Start-Service -Name $service -ErrorAction SilentlyContinue
+          }
+          $ProgressPreference = 'SilentlyContinue'
+          $zip = Join-Path $env:RUNNER_TEMP 'vbcable.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'vbcable'
+          Invoke-WebRequest 'https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip' -OutFile $zip -UserAgent 'Mozilla/5.0'
+          Expand-Archive $zip -DestinationPath $dir -Force
+          # Trust the driver's publisher, so the silent install asks nothing.
+          $signed = Get-ChildItem $dir -Recurse -Include *.cat |
+            Where-Object { (Get-AuthenticodeSignature $_.FullName).SignerCertificate } |
+            Select-Object -First 1
+          $certificate = (Get-AuthenticodeSignature $signed.FullName).SignerCertificate
+          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('TrustedPublisher', 'LocalMachine')
+          $store.Open('ReadWrite'); $store.Add($certificate); $store.Close()
+          Start-Process -FilePath (Join-Path $dir 'VBCABLE_Setup_x64.exe') -ArgumentList '-i', '-h' -Wait
+          Start-Sleep -Seconds 5
+          Restart-Service AudioEndpointBuilder -Force -ErrorAction SilentlyContinue
+          Restart-Service Audiosrv -Force
+          Start-Sleep -Seconds 5
+          Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue | Format-Table FriendlyName, Status
+          # Let desktop programs use the microphone.
+          foreach ($key in @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone',
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\NonPackaged',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone')) {
+            New-Item -Path $key -Force | Out-Null
+            Set-ItemProperty -Path $key -Name Value -Value 'Allow'
+          }
+
+      - name: Record the tone (Linux)
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        env:
+          CAPTA_TEST_TONE: 440
+        run: |
+          (while true; do paplay -d loop "$RUNNER_TEMP/tone.wav"; done) &
+          cargo run --example capta-record -- --list
+          cargo test -- --ignored --test-threads=1 --nocapture
+
+      - name: Record the tone (macOS)
+        if: runner.os == 'macOS'
+        timeout-minutes: 10
+        env:
+          CAPTA_TEST_TONE: 440
+        run: |
+          (while true; do afplay "$RUNNER_TEMP/tone.wav"; done) &
+          cargo run --example capta-record -- --list
+          cargo test -- --ignored --test-threads=1 --nocapture
+
+      - name: Record the tone (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        shell: pwsh
+        env:
+          CAPTA_TEST_TONE: 440
+        run: |
+          $player = New-Object System.Media.SoundPlayer (Join-Path $env:RUNNER_TEMP 'tone.wav')
+          $player.PlayLooping()
+          cargo run --example capta-record -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -- --ignored --test-threads=1 --nocapture
+          $result = $LASTEXITCODE
+          $player.Stop()
+          exit $result
