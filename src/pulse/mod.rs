@@ -384,9 +384,9 @@ fn decode(mut bytes: &[u8], partial: &mut Vec<u8>, samples: &mut Vec<f32>) {
             partial.clear();
         }
     }
-    let chunks = bytes.chunks_exact(4);
-    partial.extend_from_slice(chunks.remainder());
-    samples.extend(chunks.map(|sample| f32::from_le_bytes(sample.try_into().unwrap())));
+    let (whole, rest) = bytes.as_chunks::<4>();
+    partial.extend_from_slice(rest);
+    samples.extend(whole.iter().map(|&sample| f32::from_le_bytes(sample)));
 }
 
 /// Reads an event of the stream on `channel`. Returns whether the server suspended the stream
