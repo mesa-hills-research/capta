@@ -313,7 +313,10 @@ mod tests {
     #[test]
     fn a_panic_gives_the_permit_back() {
         static PERMITS: Permits = Permits::new();
-        let result = run("test", soon(), &PERMITS, |_: Start<()>| {
+        // A panic can take long to print, as when it captures a backtrace on Windows, and the
+        // caller learns of it as soon as the thread ends.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let result = run("test", deadline, &PERMITS, |_: Start<()>| {
             panic!("a failing start")
         });
         assert_eq!(result.map(|_| ()), Err(Late::Failed));
@@ -361,7 +364,9 @@ mod tests {
     fn a_thread_that_gives_up_doesnt_make_the_caller_wait_for_its_cleanup() {
         static PERMITS: Permits = Permits::new();
         let mut waited = Vec::new();
-        for attempt in 0..32 {
+        // The cleanup is long next to the deadline, so a late timer, as on a busy macOS
+        // machine, doesn't pass for waiting.
+        for attempt in 0..12 {
             let deadline = Instant::now() + Duration::from_millis(10);
             let began = Instant::now();
             let result = run("test", deadline, &PERMITS, move |start: Start<()>| {
@@ -370,12 +375,12 @@ mod tests {
                 }
                 assert_eq!(start.finish(()), Err(()));
                 // Stands in for a native stream that takes a while to drop.
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(300));
                 drop(start);
             });
             let elapsed = began.elapsed();
             let result = result.map(|_| ());
-            if elapsed > Duration::from_millis(40) || result != Err(Late::Deadline) {
+            if elapsed > Duration::from_millis(150) || result != Err(Late::Deadline) {
                 waited.push((attempt, elapsed, result));
             }
             while PERMITS.taken() != 0 {
