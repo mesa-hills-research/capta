@@ -23,8 +23,10 @@ top of the file's section.
   their own, independent of anything else the system reports, and are compared with the room
   they describe. Strings are read up to a limit. A reply that doesn't fit is an error, never a
   panic or an allocation of what the system claims.
-- Of a structure the system fills, Capta reads only the fields the system's documentation
-  says it sets, field by field through raw pointers, never the whole structure.
+- A structure whose other fields the system may leave unwritten, an Audio Queue buffer or
+  time stamp, is read field by field through raw pointers, and only the fields the system's
+  documentation says it sets. A structure the system fills whole, such as the `WAVEFORMATEX`
+  from `GetMixFormat`, is read whole.
 - No callback Capta gives the system can unwind. The one callback, macOS's buffer callback, is
   `extern "C"`, so a panic in it would abort rather than unwind into the system, and it has no
   code that panics.
