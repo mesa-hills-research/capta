@@ -1,10 +1,10 @@
 //! Microphone capture in pure Rust.
 //!
-//! On Linux, Capta speaks the PulseAudio native protocol over its Unix socket, which both
-//! PulseAudio and PipeWire (through pipewire-pulse) serve, so it needs no C library and no
-//! system development package. The sound server mixes the device's channels down and
-//! resamples to the rate asked for. On macOS and Windows it records through
-//! [cpal](https://docs.rs/cpal).
+//! Capta needs no C library and no system development package. On Linux it speaks the
+//! PulseAudio native protocol over its Unix socket, which both PulseAudio and PipeWire (through
+//! pipewire-pulse) serve. On Windows it records through WASAPI and on macOS through Core Audio,
+//! calling the system's own libraries. The system mixes the device's channels down and
+//! resamples to the rate asked for.
 //!
 //! ```no_run
 //! let options = capta::Options { sample_rate: 16_000, ..capta::Options::default() };
@@ -20,20 +20,40 @@
 //!
 //! Each capture runs on a thread of its own, which calls `on_audio` with mono `f32` samples
 //! and their rate. The callback should hand the samples on and return, since a callback
-//! that blocks for seconds makes the sound server drop audio.
+//! that blocks for seconds makes the system drop audio.
+
+#![cfg_attr(target_os = "linux", forbid(unsafe_code))]
 
 mod error;
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "windows", target_os = "macos")),
+    allow(dead_code)
+)]
 mod startup;
+
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+mod native;
 
 #[cfg(target_os = "linux")]
 mod pulse;
 #[cfg(target_os = "linux")]
 use pulse as backend;
 
-#[cfg(not(target_os = "linux"))]
-mod cpal_host;
-#[cfg(not(target_os = "linux"))]
-use cpal_host as backend;
+#[cfg(target_os = "windows")]
+mod wasapi;
+#[cfg(target_os = "windows")]
+use wasapi as backend;
+
+#[cfg(target_os = "macos")]
+mod coreaudio;
+#[cfg(target_os = "macos")]
+use coreaudio as backend;
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+mod unsupported;
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+use unsupported as backend;
 
 use std::time::Duration;
 
@@ -43,7 +63,8 @@ pub use error::{Error, ErrorKind};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Device {
     /// Names the device in [`Options::device`]. On Linux it's the sound server's source name,
-    /// such as `alsa_input.pci-0000_00_1f.3.analog-stereo`.
+    /// such as `alsa_input.pci-0000_00_1f.3.analog-stereo`. On Windows it's `wasapi:` and the
+    /// endpoint's id, and on macOS `coreaudio:` and the device's UID.
     pub id: String,
     /// What to show a person, such as "Built-in Audio Analog Stereo".
     pub name: String,
@@ -54,15 +75,17 @@ pub struct Device {
 #[derive(Clone, Debug)]
 pub struct Options {
     /// The device's [`Device::id`], or `None` for the system's default. On Linux a capture of
-    /// the default follows it when the user picks another.
+    /// the default follows it when the user picks another. On macOS and Windows it stays on
+    /// the device that was the default when it started.
     pub device: Option<String>,
     /// The rate to deliver, in Hz. On Linux the sound server delivers exactly this. On macOS
-    /// and Windows the device's own rate comes when it can't, and `on_audio` says which.
+    /// and Windows the device's own rate comes when the system can't convert to it, and
+    /// `on_audio` says which.
     pub sample_rate: u32,
-    /// About how much audio each call of `on_audio` carries, from 1 ms to 1 s. On macOS and
-    /// Windows the system decides.
+    /// How much audio each call of `on_audio` carries, from 1 ms to 1 s. On Linux it's about
+    /// this much, as the sound server packs it, and on macOS and Windows exactly this much.
     pub piece: Duration,
-    /// The name the sound server shows for the recording program.
+    /// The name the sound server shows for the recording program, on Linux.
     pub app_name: String,
 }
 
@@ -104,8 +127,8 @@ pub fn devices() -> Result<Vec<Device>, Error> {
 /// async runtime's workers.
 ///
 /// `on_audio` and `on_error` run on a thread of the capture's own. `on_error` runs at most
-/// once, when a running capture stops, and `on_audio` never runs after it. On Linux a capture
-/// fails as `Stalled` when no audio comes for 5 s while the stream isn't suspended.
+/// once, when a running capture stops, and `on_audio` never runs after it. A capture fails as
+/// `Stalled` when no audio comes for 5 s, on Linux while the stream isn't suspended.
 pub fn open(
     options: &Options,
     on_audio: impl FnMut(&[f32], u32) + Send + 'static,
@@ -169,4 +192,15 @@ pub(crate) struct Opened {
     pub stream: backend::Stream,
     pub device: Device,
     pub sample_rate: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_capture_can_move_between_threads() {
+        fn send_and_sync<T: Send + Sync>() {}
+        send_and_sync::<super::Capture>();
+        send_and_sync::<super::Device>();
+        send_and_sync::<super::Error>();
+    }
 }

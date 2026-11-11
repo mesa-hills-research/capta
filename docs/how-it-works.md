@@ -60,7 +60,7 @@ rest.
 
 ## Startup lifecycle
 
-`devices` and `open` are startups, and both backends run them by the same four rules. On a
+`devices` and `open` are startups, and every backend runs them by the same four rules. On a
 desktop a startup takes tens to hundreds of milliseconds, so call it off a UI thread and off an
 async runtime's workers.
 
@@ -68,8 +68,8 @@ async runtime's workers.
 
 A startup has 3 s from the moment the public call begins, for everything it does. On Linux
 that's reading the cookie, connecting, and every request and reply, however the server spreads
-its bytes. Through cpal it's listing the devices, choosing a format, building the stream and
-starting it.
+its bytes. On Windows and macOS it's listing the devices, or finding the device, opening it
+and starting it.
 
 ### Admission
 
@@ -83,11 +83,11 @@ one until its deadline, then fails as `Stalled`.
 ### Cancellation
 
 Before each phase, the startup thread checks the deadline and stops once it has passed. On
-Linux the phases are reading the cookie and each connection attempt. Through cpal they're
-listing the devices, or finding the device, choosing its format, building the stream and
-starting it. The phases that
-run on the caller's thread, the requests on Linux, check the deadline before every read or
-write, and a reply already buffered when the deadline passes is refused.
+Linux the phases are reading the cookie and each connection attempt. On Windows and macOS
+they're listing the devices, or finding the device, opening it in the format asked for and
+starting it. The phases that run on the caller's thread, the requests on Linux, check the
+deadline before every read or write, and a reply already buffered when the deadline passes is
+refused.
 
 ### Acceptance
 
@@ -102,25 +102,32 @@ because sending the result follows the decision and the thread may be paused in 
 deadline bounds when a startup must finish, and the caller may return a moment later.
 
 The startup thread disposes of a result that comes too late itself. It closes a late socket,
-or stops and drops a late cpal stream without calling back, and only then gives its permit
-back.
+or stops a late stream before any of its audio reaches `on_audio`, and only then gives its
+permit back.
 
 ## Recording
 
-Each capture has one thread, which owns the socket. The `Capture` handle shares only a stop
-flag and a clone of the socket with it, and Capta takes no locks. `on_audio` and `on_error`
-run on that thread. `on_audio` should hand the samples on and return, because the server drops
-audio once its 2 s buffer fills.
+Each capture has one thread, which owns the socket on Linux, the audio client on Windows and
+the Audio Queue on macOS. The `Capture` handle shares only a stop flag and a way to wake the
+thread with it, a clone of the socket, a duplicate of the event's handle or the thread's own
+handle.
+Capta takes no locks. `on_audio` and `on_error` run on that thread. `on_audio` should hand the
+samples on and return, because the system drops audio once its 2 s buffer fills.
 
-Dropping the `Capture` sets the flag, shuts the socket down, which wakes the thread's read at
-once, and joins the thread. So the drop waits for at most one callback in progress, `on_audio`
-or `on_error`, and none runs after it. Neither may wait for the thread that drops the capture.
-A drop from inside one of the capture's own callbacks skips the join.
+Dropping the `Capture` sets the flag, wakes the thread at once by shutting the socket down,
+setting the event or unparking the thread, and joins the thread. So the drop waits for at
+most one callback in progress, `on_audio` or `on_error`, and none runs after it. Neither may
+wait for the thread that drops the capture. A drop from inside one of the capture's own
+callbacks skips the join.
 
-Only decoded samples count as audio. When none come for 5 s and the stream isn't suspended,
-the capture ends with `Stalled`, even while events or parts of a packet keep arriving. The 5 s
-start again after each `on_audio` returns, so a slow callback doesn't count against the
-server.
+Only decoded samples count as audio. When none come for 5 s, and on Linux the stream isn't
+suspended, the capture ends with `Stalled`, even while events or parts of a packet keep
+arriving. The 5 s start again after each `on_audio` returns, so a slow callback doesn't count
+against the system.
+
+On Windows and macOS the device starts before the handover, and its audio waits for the
+capture's thread, which reads none until the handover is decided. So `on_audio` gets the
+recording from its start, in pieces of exactly `Options::piece`.
 
 ## Errors
 
@@ -130,36 +137,77 @@ lowercase detail for logs.
 | Kind | Cause |
 |---|---|
 | `NoDevice` | No microphone, or none with the id asked for |
-| `NoServer` | No sound server answers |
+| `NoServer` | No sound server answers, or the audio service of Windows or macOS isn't running |
 | `Busy` | Another program has the device |
 | `PermissionDenied` | The server refused the login, the socket refused this user, or the system refused access to the microphone |
-| `Disconnected` | The server closed the connection or ended the stream |
-| `Stalled` | Opening took more than 3 s, or the server sent no audio for 5 s |
+| `Disconnected` | The server closed the connection or ended the stream, or the device went away |
+| `Stalled` | Opening took more than 3 s, or no audio came for 5 s |
 | `Overrun` | Audio was lost, on macOS and Windows, so the recording has a gap |
-| `Protocol` | The server sent something Capta can't read |
+| `Protocol` | The server or the system sent something Capta can't read |
 | `Unsupported` | A rate, piece length, network server or protocol version Capta doesn't support |
 | `Io` | The operating system failed a call |
 
-## macOS and Windows
+## Windows
 
-Capta records through cpal 0.18. It picks the device's format with the rate asked for when the
-device has it, preferring `f32` and the fewest channels, else the device's default format. It
-mixes the channels down to mono, and `on_audio` gets the rate it records at. cpal's stream
-lives on a thread of the capture's own, since it isn't `Send` everywhere, and cpal calls
-`on_audio` on its audio thread.
+Capta records through WASAPI, calling ole32.dll and kernel32.dll itself. The linker binds the
+two by name (raw-dylib), so building needs neither an import library nor the Windows SDK.
 
-Starting follows the lifecycle above, on the capture's thread, which gives its permit back once
-the stream is handed over or dropped. The device starts before the handover, and `on_audio`
-gets nothing until the capture's thread opens the gate just after it. So the first buffers are
-dropped, and the gate can open a little after `open` returns. When cpal reports an overrun,
-audio was lost, so the capture ends with `Overrun` before the next buffer reaches `on_audio`.
+`devices()` lists the capture endpoints that are present and enabled, with `wasapi:` and the
+endpoint's id as the device's id and its friendly name as the name, and marks the default
+endpoint of the console role. Capta 0.1 gave the same ids and names.
 
-Cargo resolves dependencies for every platform at once, and only one package in a project may
-link ALSA. So a project that uses Capta can't also use a crate that links another version of
-`alsa-sys`, such as cpal 0.15, even though Capta itself never builds cpal on Linux.
+The capture's thread enters COM's multithreaded apartment and initializes an `IAudioClient` on
+the endpoint in shared mode, for one channel of 32-bit floats at `Options::sample_rate`, with
+`AUTOCONVERTPCM` and `SRC_DEFAULT_QUALITY`. So the audio engine mixes down and resamples. When
+the engine refuses that rate, a new client records at the engine's own rate, which `on_audio`
+then gets. The engine buffers 2 s and sets an event for each packet, every 10 ms or so. The
+thread waits on the event and reads every packet that's ready.
+
+| Packet | Effect |
+|---|---|
+| Marked as following a gap | The capture ends with `Overrun`, except for the first packet after starting, whose mark Windows leaves undefined |
+| Marked silent | Counts as silence, whatever its bytes |
+| Longer than the engine's buffer | The capture ends with `Protocol` |
+
+A capture of the default stays on the endpoint that was the default when it opened. When the
+endpoint goes away the capture ends with `Disconnected`.
+
+## macOS
+
+Capta records through Core Audio, calling the CoreFoundation, CoreAudio and AudioToolbox
+frameworks itself.
+
+`devices()` lists the audio devices that have an input stream, with `coreaudio:` and the
+device's UID as the id and its name as the name, and marks the default input device. Capta 0.1
+gave the same ids and names.
+
+The capture's thread makes an Audio Queue that records one channel of 32-bit floats at
+`Options::sample_rate` from the device. The queue converts the device's format and rate itself
+and leaves the device's own rate alone. When it refuses the rate, it records at the device's
+nominal rate instead, which `on_audio` then gets. Its buffers hold `Options::piece` each, within
+10 to 100 ms, and 2 s together.
+
+The queue calls back on a thread of its own with each filled buffer. The callback copies the
+samples into a ring that holds 2 s, gives the buffer back to the queue, and does nothing else.
+It takes no lock, allocates nothing and doesn't wake the capture thread, which looks at the ring
+every 5 ms instead. The capture ends with `Overrun` when the ring is full because the capture
+thread fell behind, or when a buffer starts later than the last one ended because the queue
+dropped audio. Every 250 ms the capture thread checks that the device is still there, and ends
+the capture with `Disconnected` when it isn't.
+
+macOS asks the person whether the program may use the microphone the first time it records.
+Until they allow it, and after they refuse, the system records silence rather than failing.
+
+## Safety
+
+On Linux the crate has no `unsafe` code, and forbids it. On Windows and macOS `unsafe` code
+only calls the system, in `src/wasapi/com.rs` and `src/coreaudio/ffi.rs`, each block with the
+reason it's sound. [Why this is safe](why-this-is-safe.md) lists them all.
 
 ## Tests
 
 `cargo test` runs the client against a fake server that answers with replies recorded from
-pipewire-pulse 1.6.2 (`tests/fixtures/`). `cargo test -- --ignored` also records from the sound
-server the machine runs.
+pipewire-pulse 1.6.2 (`tests/fixtures/`). `cargo test -- --ignored` also records from the
+machine's default microphone. CI runs both on Linux, macOS and Windows, the second against a
+loopback device that plays a 440 Hz tone, with `CAPTA_TEST_TONE=440` so the tests check that
+the recording carries it.

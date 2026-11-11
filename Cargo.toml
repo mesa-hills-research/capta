@@ -4,21 +4,26 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"
-description = "Microphone capture in pure Rust. On Linux it speaks the PulseAudio protocol that PulseAudio and PipeWire serve, with no C library."
+description = "Microphone capture in pure Rust with no C library, through the PulseAudio protocol on Linux, WASAPI on Windows and Core Audio on macOS."
 repository = "https://github.com/mesa-hills-research/capta"
 documentation = "https://docs.rs/capta"
 readme = "README.md"
-keywords = ["audio", "microphone", "recording", "pulseaudio", "pipewire"]
+keywords = ["audio", "microphone", "recording", "pipewire", "wasapi"]
 categories = ["multimedia::audio"]
 
-# On Linux the crate uses only the standard library. Elsewhere it records through cpal.
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-cpal = "0.18.2"
+# The crate uses only the standard library, and the system's own libraries on Windows and macOS.
 
 # An independent encoder and decoder of the PulseAudio protocol, for the tests to check ours
 # against.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pulseaudio = "=0.3.2"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
 
 [[example]]
 name = "capta-record"

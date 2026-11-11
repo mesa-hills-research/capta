@@ -128,12 +128,6 @@ impl<T> Start<T> {
         Instant::now() >= self.deadline || !self.outcome.is_pending()
     }
 
-    /// The time left for the next phase.
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn time_left(&self) -> Duration {
-        self.deadline.saturating_duration_since(Instant::now())
-    }
-
     /// Hands `result` to the caller if the deadline hasn't passed and nothing was decided yet,
     /// else gives it back for the startup thread to dispose of.
     pub(crate) fn finish(&self, result: T) -> Result<(), T> {

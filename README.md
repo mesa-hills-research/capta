@@ -1,10 +1,11 @@
 # Capta
 
-Capta records the microphone in pure Rust. On Linux it speaks the PulseAudio native protocol over
-the sound server's socket, which PulseAudio and PipeWire both serve, so building it needs no C
-library and no system package such as `libasound2-dev`. The server mixes the device down to mono
-and resamples it to the rate you ask for. On macOS and Windows Capta records through
-[cpal](https://crates.io/crates/cpal).
+Capta records the microphone in pure Rust, with no dependencies. On Linux it speaks the
+PulseAudio native protocol over the sound server's socket, which PulseAudio and PipeWire both
+serve, so building it needs no C library and no system package such as `libasound2-dev`. On
+Windows it records through WASAPI and on macOS through Core Audio, calling the system's own
+libraries directly. The system mixes the device down to mono and resamples it to the rate you
+ask for.
 
 ## Install
 
@@ -38,8 +39,8 @@ The example records into a WAV file.
 cargo run --example capta-record -- speech.wav 5
 ```
 
-[How it works](docs/how-it-works.md) covers the protocol, threads, errors and the macOS and
-Windows path.
+[How it works](docs/how-it-works.md) covers the protocol, threads, errors and the Windows and
+macOS backends. [Why this is safe](docs/why-this-is-safe.md) argues for every `unsafe` block.
 
 ## Licence
 
