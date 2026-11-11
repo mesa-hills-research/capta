@@ -5,6 +5,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -19,11 +22,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          components: rustfmt, clippy
+          persist-credentials: false
+
+      - name: Rust 1.99.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.99.0
 
       - name: Format
         run: cargo fmt --check
@@ -34,6 +42,18 @@ jobs:
       # No audio device yet, so this also covers listing and opening without one.
       - name: Test
         run: cargo test
+
+      # Core Audio's buffers and time stamps are read field by field, which Miri checks
+      # against structures whose other fields were never written.
+      - name: Read Core Audio's structures under Miri
+        if: runner.os == 'macOS'
+        run: |
+          rustup toolchain install nightly-2026-10-08 --profile minimal --component miri,rust-src
+          cargo +nightly-2026-10-08 miri test --lib -- \
+            coreaudio::ffi::tests::a_filled_buffer \
+            coreaudio::ffi::tests::a_time_stamp \
+            coreaudio::ffi::tests::a_second_callback \
+            native::tests::a_ring
 
       # macOS runners come with two input devices of their own.
       - name: Open the microphone without one
@@ -73,24 +93,74 @@ jobs:
           pactl set-default-source mic
           pactl list short sources
 
+      # BlackHole 0.7.1, checked against its SHA-256 and its signer before it's installed.
       - name: Add a loopback microphone (macOS)
         if: runner.os == 'macOS'
+        timeout-minutes: 8
         run: |
-          brew install switchaudio-osx blackhole-2ch
+          set -euo pipefail
+          PKG="$RUNNER_TEMP/BlackHole2ch-0.7.1.pkg"
+          curl -fsSL -o "$PKG" https://existential.audio/downloads/BlackHole2ch-0.7.1.pkg
+          echo "57b540f27a3e29c37e310e01bee0fdfab76733087e47f997ef9dccf851400dcf  $PKG" | shasum -a 256 -c -
+          pkgutil --check-signature "$PKG" | tee "$RUNNER_TEMP/signature.txt"
+          grep -q "signed by a developer certificate issued by Apple" "$RUNNER_TEMP/signature.txt"
+          grep -q "Developer ID Installer: Existential Audio Inc. (Q5C99V536K)" "$RUNNER_TEMP/signature.txt"
+          sudo installer -pkg "$PKG" -target /
           sudo killall -9 coreaudiod || true
-          sleep 5
-          SwitchAudioSource -a
-          SwitchAudioSource -t input -s "BlackHole 2ch"
-          SwitchAudioSource -t output -s "BlackHole 2ch"
+          # Make BlackHole the default input and output, through Core Audio itself.
+          cat > "$RUNNER_TEMP/default-device.swift" <<'EOF'
+          import CoreAudio
+
+          let system = AudioObjectID(kAudioObjectSystemObject)
+
+          func address(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+              AudioObjectPropertyAddress(
+                  mSelector: selector,
+                  mScope: kAudioObjectPropertyScopeGlobal,
+                  mElement: kAudioObjectPropertyElementMain)
+          }
+
+          var uid = CommandLine.arguments[1] as CFString
+          var device = AudioDeviceID(kAudioObjectUnknown)
+          var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+          var translate = address(kAudioHardwarePropertyTranslateUIDToDevice)
+          let found = withUnsafePointer(to: &uid) { qualifier in
+              AudioObjectGetPropertyData(
+                  system, &translate, UInt32(MemoryLayout<CFString>.size), qualifier, &size, &device)
+          }
+          guard found == noErr, device != AudioDeviceID(kAudioObjectUnknown) else {
+              fatalError("No device has the UID \(uid) (status \(found)).")
+          }
+          for selector in [
+              kAudioHardwarePropertyDefaultInputDevice,
+              kAudioHardwarePropertyDefaultOutputDevice,
+              kAudioHardwarePropertyDefaultSystemOutputDevice,
+          ] {
+              var target = address(selector)
+              let set = AudioObjectSetPropertyData(
+                  system, &target, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &device)
+              guard set == noErr else { fatalError("Setting a default device failed (status \(set)).") }
+          }
+          print("The default input and output are \(uid).")
+          EOF
+          for attempt in 1 2 3 4 5; do
+            sleep 3
+            swift "$RUNNER_TEMP/default-device.swift" BlackHole2ch_UID && break
+            if [ "$attempt" = 5 ]; then exit 1; fi
+          done
           # Let processes the runner starts use the microphone.
           DB="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
           sqlite3 "$DB" "INSERT OR IGNORE INTO access VALUES ('kTCCServiceMicrophone','/usr/local/opt/runner/provisioner/provisioner',1,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,1687786159,NULL,NULL,'UNUSED',1687786159);" \
             || sqlite3 "$DB" "INSERT OR IGNORE INTO access VALUES ('kTCCServiceMicrophone','/usr/local/opt/runner/provisioner/provisioner',1,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,1687786159);"
 
+      # VB-CABLE driver pack 45, checked against its SHA-256 and its files' signers before
+      # anything in it runs.
       - name: Add a loopback microphone (Windows)
         if: runner.os == 'Windows'
+        timeout-minutes: 8
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           foreach ($service in @("AudioEndpointBuilder", "Audiosrv")) {
             Set-Service -Name $service -StartupType Automatic
             Start-Service -Name $service -ErrorAction SilentlyContinue
@@ -99,14 +169,22 @@ jobs:
           $zip = Join-Path $env:RUNNER_TEMP 'vbcable.zip'
           $dir = Join-Path $env:RUNNER_TEMP 'vbcable'
           Invoke-WebRequest 'https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip' -OutFile $zip -UserAgent 'Mozilla/5.0'
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+          if ($hash -ne 'B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB') {
+            throw "The VB-CABLE archive changed. Its SHA-256 is $hash."
+          }
           Expand-Archive $zip -DestinationPath $dir -Force
-          # Trust the driver's publisher, so the silent install asks nothing.
-          $signed = Get-ChildItem $dir -Recurse -Include *.cat |
-            Where-Object { (Get-AuthenticodeSignature $_.FullName).SignerCertificate } |
-            Select-Object -First 1
-          $certificate = (Get-AuthenticodeSignature $signed.FullName).SignerCertificate
-          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('TrustedPublisher', 'LocalMachine')
-          $store.Open('ReadWrite'); $store.Add($certificate); $store.Close()
+          $signers = @{
+            'VBCABLE_Setup_x64.exe' = 'A77952D93229D0EC36E2543081EEA7D125732B9C'
+            'vbaudio_cable64_win10.cat' = '9A4A6CFEE73C6B65945FCAA083DFBCC1E9077E7E'
+          }
+          foreach ($file in $signers.Keys) {
+            $signature = Get-AuthenticodeSignature (Join-Path $dir $file)
+            $thumbprint = $signature.SignerCertificate.Thumbprint
+            if ($signature.Status -ne 'Valid' -or $thumbprint -ne $signers[$file]) {
+              throw "$file isn't signed as expected ($($signature.Status), $thumbprint)."
+            }
+          }
           Start-Process -FilePath (Join-Path $dir 'VBCABLE_Setup_x64.exe') -ArgumentList '-i', '-h' -Wait
           Start-Sleep -Seconds 5
           Restart-Service AudioEndpointBuilder -Force -ErrorAction SilentlyContinue
