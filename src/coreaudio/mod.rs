@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use ffi::{AudioObjectId, CfString, Failure, Gathered, OsStatus, Queue};
 
 use crate::native::{
-    Pieces, STALL, TIMEOUT, frames_in, late_error, overrun, parse_id, stalled, too_slow,
+    Attempt, MAX_RATE, Pieces, STALL, TIMEOUT, frames_in, late_error, names_device, open_at_rate,
+    overrun, stalled, too_slow, visit,
 };
 use crate::startup::{self, STARTS, Start};
 use crate::{Device, Error, ErrorKind, OnAudio, OnError, Opened, Options};
@@ -37,7 +38,7 @@ pub(crate) fn devices() -> Result<Vec<Device>, Error> {
         if start.is_over() {
             return;
         }
-        let _ = start.finish(list());
+        let _ = start.finish(list(&|| start.is_over()));
     };
     match startup::run("capta-devices", deadline, &STARTS, listing) {
         Ok((devices, _thread)) => devices,
@@ -45,28 +46,33 @@ pub(crate) fn devices() -> Result<Vec<Device>, Error> {
     }
 }
 
-fn list() -> Result<Vec<Device>, Error> {
+fn list(is_over: &dyn Fn() -> bool) -> Result<Vec<Device>, Error> {
     let failed = |failed| failure(failed, "listing the devices");
     let default = ffi::default_input().map_err(failed)?;
-    let devices = ffi::devices().map_err(failed)?;
-    Ok(devices
-        .into_iter()
-        .filter_map(|object| describe(object, default))
-        .collect())
+    let objects = ffi::devices().map_err(failed)?;
+    let mut devices = Vec::new();
+    visit(objects.len(), is_over, |index| {
+        devices.extend(input_uid(objects[index]).map(|uid| describe(objects[index], uid, default)));
+        Ok(true)
+    })?;
+    Ok(devices)
 }
 
-/// A device with input as `devices` lists it, or none for one without input or whose UID
-/// can't be read.
-fn describe(object: AudioObjectId, default: Option<AudioObjectId>) -> Option<Device> {
+/// The UID of a device with input, or none for one without input or whose UID can't be read.
+fn input_uid(object: AudioObjectId) -> Option<String> {
     if !ffi::has_input(object).ok()? {
         return None;
     }
-    let uid = ffi::uid(object).ok()?;
-    Some(Device {
+    ffi::uid(object).ok()
+}
+
+/// A device with input as `devices` lists it.
+fn describe(object: AudioObjectId, uid: String, default: Option<AudioObjectId>) -> Device {
+    Device {
         id: format!("{PREFIX}:{uid}"),
         name: ffi::name(object).ok().flatten().unwrap_or_default(),
         is_default: default == Some(object),
-    })
+    }
 }
 
 /// A running capture's handle.
@@ -160,66 +166,70 @@ impl Recorder {
     /// Opens the device and starts it. Each phase begins only while the startup is on.
     fn open<T>(options: &Options, start: &Start<T>) -> Result<Recorder, Error> {
         let failed = |failed| failure(failed, "opening the device");
-        if start.is_over() {
+        let is_over = || start.is_over();
+        if is_over() {
             return Err(too_slow());
         }
         let default = ffi::default_input().map_err(failed)?;
-        let (object, device) = match &options.device {
+        let (object, uid) = match &options.device {
             None => {
                 let none = || Error::new(ErrorKind::NoDevice, "the system has no microphone");
                 let object = default.ok_or_else(none)?;
-                (object, describe(object, default).ok_or_else(none)?)
+                (object, input_uid(object).ok_or_else(none)?)
             }
             Some(wanted) => {
-                let unknown = || {
+                let objects = ffi::devices().map_err(failed)?;
+                let mut found = None;
+                visit(objects.len(), &is_over, |index| {
+                    // The UID is compared exactly, and the prefix in any case.
+                    let uid =
+                        input_uid(objects[index]).filter(|uid| names_device(wanted, PREFIX, uid));
+                    let named = uid.is_some();
+                    found = uid.map(|uid| (objects[index], uid));
+                    Ok(!named)
+                })?;
+                found.ok_or_else(|| {
                     Error::new(
                         ErrorKind::NoDevice,
                         format!("the system has no device named {wanted}"),
                     )
-                };
-                parse_id(wanted, PREFIX).ok_or_else(unknown)?;
-                ffi::devices()
-                    .map_err(failed)?
-                    .into_iter()
-                    .find_map(|object| {
-                        let device = describe(object, default)?;
-                        (device.id == *wanted).then_some((object, device))
-                    })
-                    .ok_or_else(unknown)?
+                })?
             }
         };
-        if start.is_over() {
-            return Err(too_slow());
-        }
+        let cf_uid = CfString::new(&uid).map_err(failed)?;
+        let device = describe(object, uid, default);
 
-        let uid = parse_id(&device.id, PREFIX).unwrap_or_default();
-        let uid = CfString::new(uid).map_err(failed)?;
-        let mut rate = options.sample_rate;
-        let queue = loop {
-            let started = prepare_queue(&uid, rate, options.piece).and_then(|queue| {
-                if start.is_over() {
-                    return Ok(None);
-                }
-                queue.start()?;
-                Ok(Some(queue))
-            });
-            match started {
-                Ok(Some(queue)) => break queue,
-                Ok(None) => return Err(too_slow()),
-                Err(Failure::Status(status))
-                    if is_format_refusal(status) && rate == options.sample_rate =>
-                {
-                    // Record at the device's own rate instead.
-                    let own = ffi::nominal_rate(object).map_err(failed)?.round();
-                    rate = Some(own)
-                        .filter(|own| (1.0..=384_000.0).contains(own))
-                        .map(|own| own as u32)
-                        .filter(|&own| own != rate)
-                        .ok_or_else(|| failed(Failure::Status(status)))?;
-                }
-                Err(failed_start) => return Err(failed(failed_start)),
+        let attempt = |rate| {
+            let queue = prepare_queue(&cf_uid, rate, options.piece).map_err(Attempt::Failed)?;
+            if is_over() {
+                return Err(Attempt::Late);
             }
+            queue.start().map_err(Attempt::Failed)?;
+            Ok(queue)
         };
+        let refuses_rate = |failed: &Failure| matches!(failed, Failure::Status(status) if is_format_refusal(*status));
+        // A rate that isn't a whole number of Hz in range becomes 0, which isn't tried.
+        let own_rate = || {
+            ffi::nominal_rate(object).map(|own| {
+                let own = own.round();
+                if (1.0..=f64::from(MAX_RATE)).contains(&own) {
+                    own as u32
+                } else {
+                    0
+                }
+            })
+        };
+        let (queue, rate) = open_at_rate(
+            options.sample_rate,
+            &is_over,
+            attempt,
+            refuses_rate,
+            own_rate,
+        )
+        .map_err(|attempt| match attempt {
+            Attempt::Late => too_slow(),
+            Attempt::Failed(failed_start) => failed(failed_start),
+        })?;
         Ok(Recorder {
             queue,
             object,
@@ -261,6 +271,12 @@ impl Recorder {
                     return Err(Error::new(
                         ErrorKind::Protocol,
                         "the system handed over a buffer that ends inside a sample",
+                    ));
+                }
+                Gathered::Overlap => {
+                    return Err(Error::new(
+                        ErrorKind::Protocol,
+                        "the system handed over two buffers at once",
                     ));
                 }
                 Gathered::Failed(status) => return Err(recording(Failure::Status(status))),

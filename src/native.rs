@@ -1,5 +1,5 @@
-//! What the Windows and macOS backends share, the deadlines, the errors of a late startup and
-//! the gathering of samples into pieces.
+//! What the Windows and macOS backends share, the deadlines and errors of startups, the limits
+//! on what the system reports, and the gathering of samples into pieces.
 
 use std::time::Duration;
 
@@ -56,10 +56,95 @@ pub(crate) fn parse_id<'a>(id: &'a str, prefix: &str) -> Option<&'a str> {
     (host.eq_ignore_ascii_case(prefix) && !device.is_empty()).then_some(device)
 }
 
+/// Whether a public id names the device whose own id is `device`. The prefix matches in any
+/// case and the device's id exactly.
+pub(crate) fn names_device(id: &str, prefix: &str, device: &str) -> bool {
+    parse_id(id, prefix) == Some(device)
+}
+
 /// How many frames `time` holds at `rate`, at least one.
 pub(crate) fn frames_in(rate: u32, time: Duration) -> usize {
     let frames = (u128::from(rate) * time.as_nanos() / 1_000_000_000).max(1);
     usize::try_from(frames).unwrap_or(usize::MAX)
+}
+
+/// The most devices a list from the system may hold. Real lists hold a few.
+pub(crate) const MAX_DEVICES: usize = 4096;
+
+/// The highest rate Capta records at, in Hz.
+pub(crate) const MAX_RATE: u32 = 384_000;
+
+/// A count the system reported, when it's at most `max`.
+#[cfg(any(test, target_os = "windows"))]
+pub(crate) fn bounded(count: u32, max: usize) -> Option<usize> {
+    usize::try_from(count).ok().filter(|&count| count <= max)
+}
+
+/// The byte length of `frames` frames of `frame_bytes` each, when it's at most `limit` and
+/// `isize::MAX`, so the bytes can be a slice.
+#[cfg(any(test, target_os = "windows"))]
+pub(crate) fn byte_length(frames: u32, frame_bytes: usize, limit: usize) -> Option<usize> {
+    usize::try_from(frames)
+        .ok()?
+        .checked_mul(frame_bytes)
+        .filter(|&length| length <= limit && length <= isize::MAX.unsigned_abs())
+}
+
+/// Calls `visit` with each index below `count` in turn, until it returns false. Before each,
+/// it checks whether the startup is over, and stops with an error once it is.
+pub(crate) fn visit(
+    count: usize,
+    is_over: &dyn Fn() -> bool,
+    mut visit: impl FnMut(usize) -> Result<bool, Error>,
+) -> Result<(), Error> {
+    for index in 0..count {
+        if is_over() {
+            return Err(too_slow());
+        }
+        if !visit(index)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Why opening at a rate gave nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Attempt<E> {
+    /// The startup was over before a phase began.
+    Late,
+    Failed(E),
+}
+
+/// Opens with `attempt` at `rate`, and when the system refuses the rate, at the device's own
+/// rate from `own_rate`. The startup must still be on before the first attempt, before asking
+/// for the device's rate and before the second attempt. Returns what opened and its rate.
+pub(crate) fn open_at_rate<T, E>(
+    rate: u32,
+    is_over: &dyn Fn() -> bool,
+    mut attempt: impl FnMut(u32) -> Result<T, Attempt<E>>,
+    refuses_rate: impl Fn(&E) -> bool,
+    own_rate: impl FnOnce() -> Result<u32, E>,
+) -> Result<(T, u32), Attempt<E>> {
+    if is_over() {
+        return Err(Attempt::Late);
+    }
+    let refusal = match attempt(rate) {
+        Ok(opened) => return Ok((opened, rate)),
+        Err(Attempt::Failed(error)) if refuses_rate(&error) => error,
+        Err(other) => return Err(other),
+    };
+    if is_over() {
+        return Err(Attempt::Late);
+    }
+    let own = own_rate().map_err(Attempt::Failed)?;
+    if own == rate || !(1..=MAX_RATE).contains(&own) {
+        return Err(Attempt::Failed(refusal));
+    }
+    if is_over() {
+        return Err(Attempt::Late);
+    }
+    attempt(own).map(|opened| (opened, own))
 }
 
 /// Notices audio lost between buffers from the sample times they start at.
@@ -297,6 +382,156 @@ mod tests {
                 .enumerate()
                 .all(|(n, &sample)| sample == n as f32)
         );
+    }
+
+    #[test]
+    fn counts_from_the_system_have_a_limit() {
+        assert_eq!(bounded(0, MAX_DEVICES), Some(0));
+        assert_eq!(bounded(4096, MAX_DEVICES), Some(4096));
+        assert_eq!(bounded(4097, MAX_DEVICES), None);
+        assert_eq!(bounded(u32::MAX, MAX_DEVICES), None);
+    }
+
+    #[test]
+    fn packet_lengths_stay_within_their_limit_and_fit_a_slice() {
+        assert_eq!(byte_length(320, 4, 1 << 20), Some(1280));
+        assert_eq!(byte_length(0, 4, 1 << 20), Some(0));
+        assert_eq!(byte_length(262_144, 4, 1 << 20), Some(1 << 20));
+        assert_eq!(byte_length(262_145, 4, 1 << 20), None);
+        assert_eq!(byte_length(u32::MAX, 4, usize::MAX), {
+            // On 64-bit systems the length fits a slice, on 32-bit ones it overflows.
+            (u32::MAX as u64 * 4 <= isize::MAX as u64).then(|| u32::MAX as usize * 4)
+        });
+        // The most a slice may hold on a 32-bit system, i32::MAX bytes.
+        let limit = i32::MAX as usize;
+        assert_eq!(byte_length(0x1FFF_FFFF, 4, limit), Some(0x7FFF_FFFC));
+        assert_eq!(byte_length(0x2000_0000, 4, limit), None);
+    }
+
+    #[test]
+    fn a_visit_stops_once_the_startup_is_over() {
+        let over = std::cell::Cell::new(false);
+        let mut visited = Vec::new();
+        let result = visit(3, &|| over.get(), |index| {
+            visited.push(index);
+            // The first device took until after the deadline.
+            over.set(true);
+            Ok(true)
+        });
+        assert_eq!(visited, [0]);
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::Stalled);
+
+        let mut visited = Vec::new();
+        visit(5, &|| false, |index| {
+            visited.push(index);
+            Ok(index < 1)
+        })
+        .unwrap();
+        assert_eq!(visited, [0, 1], "a visit that found what it wanted stops");
+    }
+
+    type Opening = Result<(u32, u32), Attempt<&'static str>>;
+
+    /// An opening that records its calls, refuses the rates in `refused` and reports
+    /// `own_rate` as the device's rate.
+    fn open_with(
+        rate: u32,
+        refused: &[u32],
+        own_rate: Result<u32, &'static str>,
+        over_after: usize,
+    ) -> (Opening, Vec<String>) {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let checks = std::cell::Cell::new(0);
+        let is_over = || {
+            checks.set(checks.get() + 1);
+            checks.get() > over_after
+        };
+        let result = open_at_rate(
+            rate,
+            &is_over,
+            |rate| {
+                calls.borrow_mut().push(format!("open at {rate}"));
+                if refused.contains(&rate) {
+                    Err(Attempt::Failed("refused"))
+                } else {
+                    Ok(rate)
+                }
+            },
+            |error| *error == "refused",
+            || {
+                calls.borrow_mut().push("ask for the rate".into());
+                own_rate
+            },
+        );
+        (result, calls.into_inner())
+    }
+
+    #[test]
+    fn a_refused_rate_falls_back_to_the_devices_own() {
+        let (result, calls) = open_with(16_000, &[16_000], Ok(48_000), usize::MAX);
+        assert_eq!(result, Ok((48_000, 48_000)));
+        assert_eq!(
+            calls,
+            ["open at 16000", "ask for the rate", "open at 48000"]
+        );
+        let (result, _) = open_with(16_000, &[], Ok(48_000), usize::MAX);
+        assert_eq!(result, Ok((16_000, 16_000)));
+    }
+
+    #[test]
+    fn a_refusal_that_comes_late_starts_no_fallback() {
+        let (result, calls) = open_with(16_000, &[16_000], Ok(48_000), 1);
+        assert_eq!(result, Err(Attempt::Late));
+        assert_eq!(calls, ["open at 16000"]);
+        let (result, calls) = open_with(16_000, &[16_000], Ok(48_000), 2);
+        assert_eq!(result, Err(Attempt::Late));
+        assert_eq!(calls, ["open at 16000", "ask for the rate"]);
+        let (result, calls) = open_with(16_000, &[16_000], Ok(48_000), 0);
+        assert_eq!(result, Err(Attempt::Late));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn a_fallback_that_cant_help_keeps_the_first_refusal() {
+        for own in [Ok(16_000), Ok(0), Ok(MAX_RATE + 1)] {
+            let (result, calls) = open_with(16_000, &[16_000], own, usize::MAX);
+            assert_eq!(result, Err(Attempt::Failed("refused")));
+            assert_eq!(calls, ["open at 16000", "ask for the rate"]);
+        }
+        let (result, _) = open_with(16_000, &[16_000], Err("no rate"), usize::MAX);
+        assert_eq!(result, Err(Attempt::Failed("no rate")));
+        let (result, _) = open_with(16_000, &[16_000, 48_000], Ok(48_000), usize::MAX);
+        assert_eq!(result, Err(Attempt::Failed("refused")));
+    }
+
+    #[test]
+    fn a_device_is_named_by_its_own_id_in_any_prefix_case() {
+        assert!(names_device(
+            "coreaudio:Fixture-UID",
+            "coreaudio",
+            "Fixture-UID"
+        ));
+        assert!(names_device(
+            "COREAUDIO:Fixture-UID",
+            "coreaudio",
+            "Fixture-UID"
+        ));
+        assert!(names_device(
+            "CoreAudio:Fixture-UID",
+            "coreaudio",
+            "Fixture-UID"
+        ));
+        assert!(!names_device(
+            "coreaudio:fixture-uid",
+            "coreaudio",
+            "Fixture-UID"
+        ));
+        assert!(!names_device(
+            "wasapi:Fixture-UID",
+            "coreaudio",
+            "Fixture-UID"
+        ));
+        assert!(!names_device("Fixture-UID", "coreaudio", "Fixture-UID"));
     }
 
     #[test]

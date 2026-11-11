@@ -1,9 +1,10 @@
 //! Recording through WASAPI, on Windows.
 //!
 //! One thread per capture enters COM's multithreaded apartment, opens the endpoint in shared
-//! mode and waits on the event the audio engine sets for each packet. The engine converts the
-//! device's format to mono floats at the rate asked for. The `Capture` handle shares only a stop
-//! flag and a duplicate of the event's handle with that thread.
+//! mode with a 2 s engine buffer, and reads the packets in it every few milliseconds. The engine
+//! converts the device's format to mono floats at the rate asked for. The `Capture` handle
+//! shares only a stop flag and a duplicate of an event's handle with that thread, and sets the
+//! event to end its wait.
 
 mod com;
 
@@ -12,20 +13,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use com::{Apartment, AudioClient, CaptureClient, Endpoint, Event, Hresult, WaveFormatEx};
+use com::{
+    Apartment, AudioClient, CaptureClient, Captures, Endpoint, Event, Hresult, SharedCapture,
+};
 
 use crate::native::{
-    Pieces, STALL, TIMEOUT, frames_in, late_error, overrun, parse_id, stalled, too_slow,
+    Attempt, MAX_DEVICES, MAX_RATE, Pieces, STALL, TIMEOUT, bounded, frames_in, late_error,
+    names_device, open_at_rate, overrun, stalled, too_slow, visit,
 };
 use crate::startup::{self, STARTS, Start};
 use crate::{Device, Error, ErrorKind, OnAudio, OnError, Opened, Options};
 
 /// What starts a device's id, as in Capta 0.1.
 const PREFIX: &str = "wasapi";
-/// The engine's buffer in 100 ns units, 2 s as the Linux server's.
-const ENGINE_BUFFER: i64 = 20_000_000;
-/// How often the capture thread asks for packets when the engine signals none.
-const POLL: Duration = Duration::from_millis(100);
+/// How long the capture thread waits between looks at the engine's buffer, unless the
+/// `Capture` handle wakes it. The system's timer may make it longer.
+const POLL: Duration = Duration::from_millis(5);
+/// The most frames an engine buffer may hold, 4 s at the highest rate, twice what Capta asks
+/// for.
+const MAX_BUFFER_FRAMES: u32 = 4 * MAX_RATE;
+/// The most bytes a packet may hold, a whole buffer of mono floats.
+const MAX_PACKET_BYTES: usize = MAX_BUFFER_FRAMES as usize * 4;
 
 pub(crate) fn devices() -> Result<Vec<Device>, Error> {
     let deadline = Instant::now() + TIMEOUT;
@@ -35,7 +43,7 @@ pub(crate) fn devices() -> Result<Vec<Device>, Error> {
         }
         let devices = Apartment::enter()
             .map_err(|code| failure(code, "listing the devices"))
-            .and_then(|apartment| list(&apartment));
+            .and_then(|apartment| list(&apartment, &|| start.is_over()));
         let _ = start.finish(devices);
     };
     match startup::run("capta-devices", deadline, &STARTS, listing) {
@@ -44,16 +52,42 @@ pub(crate) fn devices() -> Result<Vec<Device>, Error> {
     }
 }
 
-fn list(apartment: &Apartment) -> Result<Vec<Device>, Error> {
+fn list(apartment: &Apartment, is_over: &dyn Fn() -> bool) -> Result<Vec<Device>, Error> {
     let failed = |code| failure(code, "listing the devices");
     let enumerator = apartment.enumerator().map_err(failed)?;
     let default = enumerator.default_capture().map_err(failed)?;
     let default = default.and_then(|endpoint| endpoint.id().ok().flatten());
-    let endpoints = enumerator.active_captures().map_err(failed)?;
-    Ok(endpoints
-        .iter()
-        .filter_map(|endpoint| describe(endpoint, default.as_deref()))
-        .collect())
+    let captures = enumerator.active_captures().map_err(failed)?;
+    let mut devices = Vec::new();
+    each_capture(&captures, "listing the devices", is_over, |endpoint| {
+        devices.extend(describe(&endpoint, default.as_deref()));
+        true
+    })?;
+    Ok(devices)
+}
+
+/// Calls `each` with each endpoint of `captures` until it returns false, while the startup is
+/// on, for `doing`. A list of more than [`MAX_DEVICES`] is refused.
+fn each_capture<'a>(
+    captures: &Captures<'a>,
+    doing: &str,
+    is_over: &dyn Fn() -> bool,
+    mut each: impl FnMut(Endpoint<'a>) -> bool,
+) -> Result<(), Error> {
+    let count = captures.count().map_err(|code| failure(code, doing))?;
+    let count = bounded(count, MAX_DEVICES).ok_or_else(|| {
+        Error::new(
+            ErrorKind::Protocol,
+            format!("{doing} failed (the audio service listed {count} devices)"),
+        )
+    })?;
+    visit(count, is_over, |index| {
+        // The index is below the count, which fits a u32.
+        let endpoint = captures
+            .get(index as u32)
+            .map_err(|code| failure(code, doing))?;
+        Ok(each(endpoint))
+    })
 }
 
 /// The endpoint as `devices` lists it, or none when its id can't be read.
@@ -131,21 +165,26 @@ fn record(
             return;
         }
     };
-    let client = match Client::open(&apartment, options, &start) {
+    // The event wakes this thread when the `Capture` handle drops. The audio engine never
+    // sees it.
+    let events = Event::new().and_then(|event| Ok((event.try_clone()?, event)));
+    let (wake, event) = match events {
+        Ok(events) => events,
+        Err(error) => {
+            let _ = start.finish(Err(io_failure(&error, "opening the device")));
+            return;
+        }
+    };
+    let client = match Client::open(&apartment, options, &start, event) {
         Ok(client) => client,
         Err(error) => {
             let _ = start.finish(Err(error));
             return;
         }
     };
-    let handover = client
-        .event
-        .try_clone()
-        .map(|wake| (client.device.clone(), client.rate, wake))
-        .map_err(|error| io_failure(&error, "opening the device"));
-    let handing_over = handover.is_ok();
-    if start.finish(handover).is_err() || !handing_over {
-        // Too late, or nothing to hand over. Nothing has reached `on_audio`.
+    let handover = Ok((client.device.clone(), client.rate, wake));
+    if start.finish(handover).is_err() {
+        // Too late. Nothing has reached `on_audio`.
         let _ = client.audio.stop();
         return;
     }
@@ -166,6 +205,7 @@ fn record(
 struct Client<'a> {
     audio: AudioClient<'a>,
     capture: CaptureClient<'a>,
+    /// What the `Capture` handle sets to end a wait.
     event: Event,
     device: Device,
     rate: u32,
@@ -178,9 +218,11 @@ impl<'a> Client<'a> {
         apartment: &'a Apartment,
         options: &Options,
         start: &Start<T>,
+        event: Event,
     ) -> Result<Client<'a>, Error> {
         let failed = |code| failure(code, "opening the device");
-        if start.is_over() {
+        let is_over = || start.is_over();
+        if is_over() {
             return Err(too_slow());
         }
         let enumerator = apartment.enumerator().map_err(failed)?;
@@ -211,28 +253,36 @@ impl<'a> Client<'a> {
                         format!("the system has no device named {wanted}"),
                     )
                 };
-                let id = parse_id(wanted, PREFIX).ok_or_else(unknown)?;
                 let default = default.and_then(|endpoint| endpoint.id().ok().flatten());
-                let endpoint = enumerator
-                    .active_captures()
-                    .map_err(failed)?
-                    .into_iter()
-                    .find(|endpoint| endpoint.id().ok().flatten().as_deref() == Some(id))
-                    .ok_or_else(unknown)?;
+                let captures = enumerator.active_captures().map_err(failed)?;
+                let mut found = None;
+                each_capture(&captures, "opening the device", &is_over, |endpoint| {
+                    let named = endpoint
+                        .id()
+                        .ok()
+                        .flatten()
+                        .is_some_and(|id| names_device(wanted, PREFIX, &id));
+                    if named {
+                        found = Some(endpoint);
+                    }
+                    !named
+                })?;
+                let endpoint = found.ok_or_else(unknown)?;
                 let device = describe(&endpoint, default.as_deref()).ok_or_else(unknown)?;
                 (endpoint, device)
             }
         };
-        if start.is_over() {
-            return Err(too_slow());
-        }
 
-        let (audio, rate) = initialize(&endpoint, options.sample_rate)?;
-        let event = Event::new().map_err(|error| io_failure(&error, "opening the device"))?;
-        audio.set_event(&event).map_err(failed)?;
+        let (audio, rate) = initialize(&endpoint, options.sample_rate, &is_over)?;
         let buffer_frames = audio.buffer_frames().map_err(failed)?;
+        if buffer_frames == 0 || buffer_frames > MAX_BUFFER_FRAMES {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                format!("the audio engine made a buffer of {buffer_frames} frames"),
+            ));
+        }
         let capture = audio.capture_client().map_err(failed)?;
-        if start.is_over() {
+        if is_over() {
             return Err(too_slow());
         }
         audio
@@ -255,19 +305,19 @@ impl<'a> Client<'a> {
         let mut audio_due = Instant::now() + STALL;
         let mut first = true;
         loop {
-            let wait = audio_due
-                .saturating_duration_since(Instant::now())
-                .min(POLL);
+            // Only the `Capture` handle sets the event, so this is a pause that it can end.
             self.event
-                .wait(wait)
+                .wait(POLL)
                 .map_err(|error| io_failure(&error, "waiting for audio"))?;
             if stop.load(Ordering::SeqCst) {
                 return Ok(());
             }
             while self.capture.next_packet_frames().map_err(recording)? > 0 {
-                let read = self.capture.read_packet(4, self.buffer_frames, |packet| {
-                    take_packet(&packet, first, &mut pieces)
-                });
+                let read =
+                    self.capture
+                        .read_packet(4, self.buffer_frames, MAX_PACKET_BYTES, |packet| {
+                            take_packet(&packet, first, &mut pieces)
+                        });
                 match read.map_err(recording)? {
                     Some(taken) => taken?,
                     None => break,
@@ -297,7 +347,7 @@ fn take_packet(packet: &com::Packet<'_>, first: bool, pieces: &mut Pieces) -> Re
         return Err(Error::new(
             ErrorKind::Protocol,
             format!(
-                "the audio engine described a packet of {} frames that its buffer can't hold",
+                "the audio engine described a packet of {} frames, more than its buffer or Capta holds",
                 packet.frames
             ),
         ));
@@ -315,33 +365,34 @@ fn take_packet(packet: &com::Packet<'_>, first: bool, pieces: &mut Pieces) -> Re
 }
 
 /// A client initialized for mono floats at `rate`, or at the engine's own rate when it can't
-/// convert to `rate`, with the rate it records at.
-fn initialize<'a>(endpoint: &Endpoint<'a>, rate: u32) -> Result<(AudioClient<'a>, u32), Error> {
-    let failed = |code| failure(code, "opening the device");
-    let audio = endpoint.activate_client().map_err(failed)?;
-    let refused = match audio.initialize(
-        &WaveFormatEx::mono_f32(rate),
-        com::STREAM_FLAGS,
-        ENGINE_BUFFER,
-    ) {
-        Ok(()) => return Ok((audio, rate)),
-        Err(code) if is_format_refusal(code) => code,
-        Err(code) => return Err(failed(code)),
+/// convert to `rate`, with the rate it records at. Each attempt, and the question of the
+/// engine's rate, begins only while the startup is on.
+fn initialize<'a>(
+    endpoint: &Endpoint<'a>,
+    rate: u32,
+    is_over: &dyn Fn() -> bool,
+) -> Result<(AudioClient<'a>, u32), Error> {
+    let attempt = |rate| {
+        let audio = endpoint.activate_client().map_err(Attempt::Failed)?;
+        audio
+            .initialize(&SharedCapture::mono_f32(rate))
+            .map_err(Attempt::Failed)?;
+        Ok(audio)
     };
-    let own = audio.mix_rate().map_err(failed)?;
-    if own == rate || !(1..=384_000).contains(&own) {
-        return Err(failed(refused));
-    }
-    // A client whose initialization failed is used no further.
-    let audio = endpoint.activate_client().map_err(failed)?;
-    audio
-        .initialize(
-            &WaveFormatEx::mono_f32(own),
-            com::STREAM_FLAGS,
-            ENGINE_BUFFER,
-        )
-        .map_err(failed)?;
-    Ok((audio, own))
+    // A client whose initialization failed is used no further, so the engine's rate comes
+    // from a new one.
+    let own_rate = || endpoint.activate_client()?.mix_rate();
+    open_at_rate(
+        rate,
+        is_over,
+        attempt,
+        |code| is_format_refusal(*code),
+        own_rate,
+    )
+    .map_err(|attempt| match attempt {
+        Attempt::Late => too_slow(),
+        Attempt::Failed(code) => failure(code, "opening the device"),
+    })
 }
 
 fn is_format_refusal(code: Hresult) -> bool {

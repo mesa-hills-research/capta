@@ -6,11 +6,12 @@
 //! argued in docs/why-this-is-safe.md.
 
 use std::ffi::{c_char, c_void};
+use std::mem::offset_of;
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::native::{Ring, Timeline};
+use crate::native::{MAX_DEVICES, Ring, Timeline};
 
 pub(crate) type OsStatus = i32;
 pub(crate) type AudioObjectId = u32;
@@ -44,9 +45,7 @@ const FORMAT_FLAGS_FLOAT_PACKED: u32 = 1 | 8;
 /// `kAudioTimeStampSampleTimeValid`.
 const SAMPLE_TIME_VALID: u32 = 1;
 const STRING_ENCODING_UTF8: u32 = 0x0800_0100;
-/// The most devices a list may hold, and the longest string read, in bytes. Real ones are far
-/// smaller.
-const MAX_DEVICES: usize = 4096;
+/// The longest string read, in bytes. Real ones are far smaller.
 const MAX_STRING_BYTES: usize = 64 * 1024;
 
 /// Why a call failed.
@@ -89,7 +88,6 @@ struct StreamDescription {
 
 /// `SMPTETime`, inside a time stamp.
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct SmpteTime {
     subframes: i16,
     subframe_divisor: i16,
@@ -102,9 +100,9 @@ struct SmpteTime {
     frames: i16,
 }
 
-/// `AudioTimeStamp`.
+/// `AudioTimeStamp`. Capta reads only its flags and the sample time they vouch for, through
+/// [`read_start`].
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct TimeStamp {
     sample_time: f64,
     host_time: u64,
@@ -115,9 +113,9 @@ struct TimeStamp {
     reserved: u32,
 }
 
-/// `AudioQueueBuffer`.
+/// `AudioQueueBuffer`. Capta reads only the fields the queue sets for a PCM recording, through
+/// [`read_filled`], and never the struct as a whole.
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct QueueBuffer {
     capacity: u32,
     data: *mut c_void,
@@ -425,6 +423,8 @@ struct Inbox {
     /// A [`Gathered`], once it isn't `Fine`, encoded by [`Gathered::bits`].
     state: AtomicU64,
     closing: AtomicBool,
+    /// Whether a callback is taking a buffer, so that only one pushes to the ring at a time.
+    taking: AtomicBool,
 }
 
 /// How recording went since it started.
@@ -439,6 +439,8 @@ pub(crate) enum Gathered {
     Malformed,
     /// A buffer couldn't go back to the queue.
     Failed(OsStatus),
+    /// Two callbacks ran at once, so the order of their buffers is unknown.
+    Overlap,
 }
 
 impl Gathered {
@@ -448,6 +450,7 @@ impl Gathered {
             Gathered::Gap => 1,
             Gathered::Full => 2,
             Gathered::Malformed => 3,
+            Gathered::Overlap => 5,
             Gathered::Failed(status) => 4 << 32 | u64::from(status.cast_unsigned()),
         }
     }
@@ -459,6 +462,7 @@ impl Gathered {
                 1 => Gathered::Gap,
                 2 => Gathered::Full,
                 3 => Gathered::Malformed,
+                5 => Gathered::Overlap,
                 _ => Gathered::Fine,
             },
         }
@@ -478,6 +482,17 @@ impl Inbox {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+    }
+
+    /// Takes a buffer, unless another callback is taking one, which ends the recording. So the
+    /// ring has one producer at a time, whatever threads the queue calls back on.
+    fn take(&self, bytes: &[u8], start: Option<f64>) {
+        if self.taking.swap(true, Ordering::Acquire) {
+            self.fail(Gathered::Overlap);
+            return;
+        }
+        self.receive(bytes, start);
+        self.taking.store(false, Ordering::Release);
     }
 
     /// Takes a buffer's bytes and the sample time they start at, when the queue gave one.
@@ -511,6 +526,57 @@ impl Inbox {
     }
 }
 
+/// The fields of a filled buffer that the queue sets for a PCM recording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Filled {
+    capacity: u32,
+    data: *mut c_void,
+    byte_size: u32,
+}
+
+/// Reads the capacity, data pointer and byte size of `buffer`, and none of its other fields,
+/// which the queue may leave unwritten for a buffer without packet descriptions.
+///
+/// # Safety
+///
+/// `buffer` points to an `AudioQueueBuffer` whose `mAudioDataBytesCapacity`, `mAudioData` and
+/// `mAudioDataByteSize` are initialized and not written during the call.
+unsafe fn read_filled(buffer: NonNull<QueueBuffer>) -> Filled {
+    let base = buffer.as_ptr().cast::<u8>();
+    let capacity = base.wrapping_add(offset_of!(QueueBuffer, capacity));
+    let data = base.wrapping_add(offset_of!(QueueBuffer, data));
+    let byte_size = base.wrapping_add(offset_of!(QueueBuffer, byte_size));
+    Filled {
+        // SAFETY: by the contract the field is initialized. Its offset within the `repr(C)`
+        // struct keeps it inside the buffer and aligned as a `u32`.
+        capacity: unsafe { capacity.cast::<u32>().read() },
+        // SAFETY: as above, for the pointer field.
+        data: unsafe { data.cast::<*mut c_void>().read() },
+        // SAFETY: as above, for the byte size.
+        byte_size: unsafe { byte_size.cast::<u32>().read() },
+    }
+}
+
+/// Reads the sample time a time stamp holds, when its flags say it holds one, and nothing
+/// else of it.
+///
+/// # Safety
+///
+/// `start` points to an `AudioTimeStamp` whose `mFlags` is initialized, and whose `mSampleTime`
+/// is initialized when `mFlags` says it's valid, neither written during the call.
+unsafe fn read_start(start: NonNull<TimeStamp>) -> Option<f64> {
+    let base = start.as_ptr().cast::<u8>();
+    let flags = base.wrapping_add(offset_of!(TimeStamp, flags));
+    let sample_time = base.wrapping_add(offset_of!(TimeStamp, sample_time));
+    // SAFETY: by the contract the flags are initialized. The offset within the `repr(C)` struct
+    // keeps them inside it and aligned as a `u32`.
+    let flags = unsafe { flags.cast::<u32>().read() };
+    (flags & SAMPLE_TIME_VALID != 0).then(|| {
+        // SAFETY: the flags say the sample time is set, at an offset aligned for an `f64`.
+        unsafe { sample_time.cast::<f64>().read() }
+    })
+}
+
 /// What a recording queue calls on one of its own threads with each filled buffer. It takes no
 /// lock, allocates nothing and calls nothing but `AudioQueueEnqueueBuffer`.
 extern "C" fn on_buffer(
@@ -532,21 +598,23 @@ extern "C" fn on_buffer(
     let Some(buffer) = NonNull::new(buffer) else {
         return;
     };
-    // SAFETY: the queue hands the callback one of its own buffers, which nothing else reads or
-    // writes until it's enqueued again below.
-    let filled = unsafe { buffer.read() };
-    // SAFETY: when not null, `start` points to the buffer's time stamp, valid during the
-    // callback.
-    let start = unsafe { start.as_ref() }
-        .filter(|time| time.flags & SAMPLE_TIME_VALID != 0)
-        .map(|time| time.sample_time);
+    // SAFETY: the queue hands the callback one of its own buffers, allocated by
+    // AudioQueueAllocateBuffer, which sets its capacity and data pointer and, once filled, its
+    // byte size. Nothing writes them until the buffer is enqueued again below.
+    let filled = unsafe { read_filled(buffer) };
+    let start = match NonNull::new(start.cast_mut()) {
+        // SAFETY: when not null, `start` points to the buffer's time stamp, valid during the
+        // callback, whose flags say which of its fields are set.
+        Some(start) => unsafe { read_start(start) },
+        None => None,
+    };
     match NonNull::new(filled.data.cast::<u8>()) {
         Some(data) if filled.byte_size <= filled.capacity => {
             // SAFETY: the buffer's data holds `capacity` bytes, of which the queue filled the
             // first `byte_size`, and they stay unchanged until the buffer is enqueued again.
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr(), filled.byte_size as usize) };
-            inbox.receive(bytes, start);
+            inbox.take(bytes, start);
         }
         None if filled.byte_size == 0 => {}
         _ => inbox.fail(Gathered::Malformed),
@@ -578,6 +646,7 @@ impl Queue {
             tolerance,
             state: AtomicU64::new(Gathered::Fine.bits()),
             closing: AtomicBool::new(false),
+            taking: AtomicBool::new(false),
         });
         let format = StreamDescription {
             sample_rate: f64::from(rate),
@@ -676,10 +745,72 @@ mod tests {
 
     #[test]
     fn layouts_match_the_headers() {
+        use std::mem::offset_of as at;
+        assert_eq!(size_of::<PropertyAddress>(), 12);
+        assert_eq!(
+            [
+                at!(PropertyAddress, selector),
+                at!(PropertyAddress, scope),
+                at!(PropertyAddress, element)
+            ],
+            [0, 4, 8]
+        );
         assert_eq!(size_of::<StreamDescription>(), 40);
+        assert_eq!(
+            [
+                at!(StreamDescription, sample_rate),
+                at!(StreamDescription, format_id),
+                at!(StreamDescription, format_flags),
+                at!(StreamDescription, bytes_per_packet),
+                at!(StreamDescription, frames_per_packet),
+                at!(StreamDescription, bytes_per_frame),
+                at!(StreamDescription, channels_per_frame),
+                at!(StreamDescription, bits_per_channel),
+                at!(StreamDescription, reserved),
+            ],
+            [0, 8, 12, 16, 20, 24, 28, 32, 36]
+        );
         assert_eq!(size_of::<SmpteTime>(), 24);
+        assert_eq!(
+            [
+                at!(SmpteTime, subframes),
+                at!(SmpteTime, subframe_divisor),
+                at!(SmpteTime, counter),
+                at!(SmpteTime, kind),
+                at!(SmpteTime, flags),
+                at!(SmpteTime, hours),
+                at!(SmpteTime, minutes),
+                at!(SmpteTime, seconds),
+                at!(SmpteTime, frames),
+            ],
+            [0, 2, 4, 8, 12, 16, 18, 20, 22]
+        );
         assert_eq!(size_of::<TimeStamp>(), 64);
+        assert_eq!(
+            [
+                at!(TimeStamp, sample_time),
+                at!(TimeStamp, host_time),
+                at!(TimeStamp, rate_scalar),
+                at!(TimeStamp, word_clock_time),
+                at!(TimeStamp, smpte_time),
+                at!(TimeStamp, flags),
+                at!(TimeStamp, reserved),
+            ],
+            [0, 8, 16, 24, 32, 56, 60]
+        );
         assert_eq!(size_of::<QueueBuffer>(), 56);
+        assert_eq!(
+            [
+                at!(QueueBuffer, capacity),
+                at!(QueueBuffer, data),
+                at!(QueueBuffer, byte_size),
+                at!(QueueBuffer, user_data),
+                at!(QueueBuffer, packet_description_capacity),
+                at!(QueueBuffer, packet_descriptions),
+                at!(QueueBuffer, packet_description_count),
+            ],
+            [0, 8, 16, 24, 32, 40, 48]
+        );
         assert_eq!(code(b"lpcm"), 0x6c70_636d);
     }
 
@@ -696,6 +827,7 @@ mod tests {
             tolerance: 1.0,
             state: AtomicU64::new(Gathered::Fine.bits()),
             closing: AtomicBool::new(false),
+            taking: AtomicBool::new(false),
         }
     }
 
@@ -729,12 +861,78 @@ mod tests {
     }
 
     #[test]
+    fn a_second_callback_at_once_ends_the_recording() {
+        let inbox = inbox(64);
+        inbox.take(&bytes(&[0.5]), None);
+        // A callback is still taking its buffer when another comes.
+        inbox.taking.store(true, Ordering::SeqCst);
+        inbox.take(&bytes(&[0.25]), None);
+        assert_eq!(inbox.state(), Gathered::Overlap);
+        let mut out = Vec::new();
+        inbox.ring.pop_into(&mut out);
+        assert_eq!(out, [0.5]);
+    }
+
+    #[test]
+    fn a_filled_buffer_is_read_without_its_unset_fields() {
+        // Only the three fields the queue sets are written. Under Miri, reading any other
+        // field, as a whole-struct read does, fails the test.
+        let mut buffer = std::mem::MaybeUninit::<QueueBuffer>::uninit();
+        let mut audio = [0u8; 8];
+        // Every pointer comes from this one, so none invalidates another.
+        let raw = buffer.as_mut_ptr();
+        let base = raw.cast::<u8>();
+        let capacity = base.wrapping_add(offset_of!(QueueBuffer, capacity));
+        let data = base.wrapping_add(offset_of!(QueueBuffer, data));
+        let byte_size = base.wrapping_add(offset_of!(QueueBuffer, byte_size));
+        // SAFETY: each pointer is a field of `buffer`'s storage, aligned for its type.
+        unsafe { capacity.cast::<u32>().write(8) };
+        // SAFETY: as above.
+        unsafe { data.cast::<*mut c_void>().write(audio.as_mut_ptr().cast()) };
+        // SAFETY: as above.
+        unsafe { byte_size.cast::<u32>().write(4) };
+        let buffer = NonNull::new(raw).unwrap();
+        // SAFETY: the three fields are initialized and nothing writes them during the read.
+        let filled = unsafe { read_filled(buffer) };
+        assert_eq!(
+            filled,
+            Filled {
+                capacity: 8,
+                data: audio.as_mut_ptr().cast(),
+                byte_size: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn a_time_stamp_is_read_only_as_far_as_its_flags_say() {
+        let mut stamp = std::mem::MaybeUninit::<TimeStamp>::uninit();
+        // Every pointer comes from this one, so none invalidates another.
+        let raw = stamp.as_mut_ptr();
+        let base = raw.cast::<u8>();
+        let flags = base.wrapping_add(offset_of!(TimeStamp, flags));
+        let sample_time = base.wrapping_add(offset_of!(TimeStamp, sample_time));
+        // SAFETY: the pointer is the flags field of `stamp`'s storage, aligned for a `u32`.
+        unsafe { flags.cast::<u32>().write(0) };
+        let start = NonNull::new(raw).unwrap();
+        // SAFETY: the flags are initialized and say nothing else is.
+        assert_eq!(unsafe { read_start(start) }, None);
+        // SAFETY: as above.
+        unsafe { flags.cast::<u32>().write(SAMPLE_TIME_VALID | 2) };
+        // SAFETY: the pointer is the sample time field, aligned for an `f64`.
+        unsafe { sample_time.cast::<f64>().write(320.0) };
+        // SAFETY: the flags and the sample time they vouch for are initialized.
+        assert_eq!(unsafe { read_start(start) }, Some(320.0));
+    }
+
+    #[test]
     fn states_survive_their_encoding() {
         for state in [
             Gathered::Fine,
             Gathered::Gap,
             Gathered::Full,
             Gathered::Malformed,
+            Gathered::Overlap,
             Gathered::Failed(-66681),
             Gathered::Failed(0x2168_6f67),
         ] {

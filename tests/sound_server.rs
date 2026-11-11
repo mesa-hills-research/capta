@@ -216,6 +216,41 @@ fn dropping_a_capture_stops_it_at_once() {
 #[cfg(not(target_os = "linux"))]
 #[test]
 #[ignore = "needs a microphone"]
+fn a_device_opens_by_its_id_with_the_prefix_in_any_case() {
+    let devices = capta::devices().unwrap();
+    let default = devices.iter().find(|device| device.is_default).unwrap();
+    let (prefix, own) = default.id.split_once(':').unwrap();
+    let shouting = Options {
+        device: Some(format!("{}:{own}", prefix.to_uppercase())),
+        ..Options::default()
+    };
+    let capture = capta::open(&shouting, |_, _| {}, |_| {}).unwrap();
+    assert_eq!(capture.device(), default);
+    drop(capture);
+    // The device's own id must match exactly.
+    let changed: String = own
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() {
+                c.to_ascii_uppercase()
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    if changed != own {
+        let other = Options {
+            device: Some(format!("{prefix}:{changed}")),
+            ..Options::default()
+        };
+        let error = capta::open(&other, |_, _| {}, |_| {}).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NoDevice, "{error}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+#[ignore = "needs a microphone"]
 fn a_capture_that_falls_behind_ends_as_overrun() {
     let calls = Arc::new(AtomicUsize::new(0));
     let (failure, failed) = mpsc::channel();

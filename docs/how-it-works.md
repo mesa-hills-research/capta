@@ -84,7 +84,8 @@ one until its deadline, then fails as `Stalled`.
 
 Before each phase, the startup thread checks the deadline and stops once it has passed. On
 Linux the phases are reading the cookie and each connection attempt. On Windows and macOS
-they're listing the devices, or finding the device, opening it in the format asked for and
+they're reading each device of a list, opening the device in the format asked for, asking for
+the device's own rate when the system refuses the format, opening it again at that rate, and
 starting it. The phases that run on the caller's thread, the requests on Linux, check the
 deadline before every read or write, and a reply already buffered when the deadline passes is
 refused.
@@ -160,14 +161,19 @@ The capture's thread enters COM's multithreaded apartment and initializes an `IA
 the endpoint in shared mode, for one channel of 32-bit floats at `Options::sample_rate`, with
 `AUTOCONVERTPCM` and `SRC_DEFAULT_QUALITY`. So the audio engine mixes down and resamples. When
 the engine refuses that rate, a new client records at the engine's own rate, which `on_audio`
-then gets. The engine buffers 2 s and sets an event for each packet, every 10 ms or so. The
-thread waits on the event and reads every packet that's ready.
+then gets. The stream is polled rather than event-driven, so the engine keeps the 2 s buffer it
+was asked for. Every 5 ms, or as soon after as the system's timer allows, the thread reads every
+packet that's ready. It waits on an event that only the `Capture` handle sets, to end the wait
+when it drops.
 
 | Packet | Effect |
 |---|---|
 | Marked as following a gap | The capture ends with `Overrun`, except for the first packet after starting, whose mark Windows leaves undefined |
 | Marked silent | Counts as silence, whatever its bytes |
-| Longer than the engine's buffer | The capture ends with `Protocol` |
+| Longer than the engine's buffer, or than 6,144,000 bytes | The capture ends with `Protocol` |
+
+A list of more than 4096 endpoints, or an engine buffer of more than 4 s at 384 kHz, is a
+`Protocol` error too.
 
 A capture of the default stays on the endpoint that was the default when it opened. When the
 endpoint goes away the capture ends with `Disconnected`.
@@ -179,7 +185,8 @@ frameworks itself.
 
 `devices()` lists the audio devices that have an input stream, with `coreaudio:` and the
 device's UID as the id and its name as the name, and marks the default input device. Capta 0.1
-gave the same ids and names.
+gave the same ids and names. An id names a device when its prefix matches in any case and its
+UID exactly, on Windows likewise with the endpoint's id.
 
 The capture's thread makes an Audio Queue that records one channel of 32-bit floats at
 `Options::sample_rate` from the device. The queue converts the device's format and rate itself
@@ -192,11 +199,12 @@ samples into a ring that holds 2 s, gives the buffer back to the queue, and does
 It takes no lock, allocates nothing and doesn't wake the capture thread, which looks at the ring
 every 5 ms instead. The capture ends with `Overrun` when the ring is full because the capture
 thread fell behind, or when a buffer starts later than the last one ended because the queue
-dropped audio. Every 250 ms the capture thread checks that the device is still there, and ends
-the capture with `Disconnected` when it isn't.
+dropped audio. Two callbacks at once, which Apple's documentation doesn't rule out, end it with
+`Protocol`, since their samples' order is unknown. Every 250 ms the capture thread checks that
+the device is still there, and ends the capture with `Disconnected` when it isn't.
 
 macOS asks the person whether the program may use the microphone the first time it records.
-Until they allow it, and after they refuse, the system records silence rather than failing.
+Capta can't read their answer, so it fails with `PermissionDenied` only when Core Audio does.
 
 ## Safety
 

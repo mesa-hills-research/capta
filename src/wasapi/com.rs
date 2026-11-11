@@ -14,6 +14,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{self, NonNull};
 use std::time::Duration;
 
+use crate::native::byte_length;
+
 /// A COM result code. Negative values are failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Hresult(pub i32);
@@ -41,9 +43,14 @@ pub(crate) const AUDCLNT_E_SERVICE_NOT_RUNNING: Hresult = Hresult::from_bits(0x8
 pub(crate) const AUDCLNT_E_RESOURCES_INVALIDATED: Hresult = Hresult::from_bits(0x8889_0026);
 const AUDCLNT_S_BUFFER_EMPTY: Hresult = Hresult::from_bits(0x0889_0001);
 
-/// `AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, `AUTOCONVERTPCM` and `SRC_DEFAULT_QUALITY`. The engine
-/// signals an event for each packet, and converts the device's format and rate to the client's.
-pub(crate) const STREAM_FLAGS: u32 = 0x0004_0000 | 0x8000_0000 | 0x0800_0000;
+/// `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` and `AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY`. The
+/// engine converts the device's format and rate to the client's.
+const STREAM_FLAGS: u32 = 0x8000_0000 | 0x0800_0000;
+/// `AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, which Capta doesn't use.
+#[cfg(test)]
+const EVENT_CALLBACK: u32 = 0x0004_0000;
+/// The engine buffer Capta asks for, 2 s in 100 ns units.
+const ENGINE_BUFFER: i64 = 20_000_000;
 /// `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`, audio was lost before this packet.
 pub(crate) const DATA_DISCONTINUITY: u32 = 1;
 /// `AUDCLNT_BUFFERFLAGS_SILENT`, the packet is silence whatever its bytes hold.
@@ -137,9 +144,32 @@ pub(crate) struct WaveFormatEx {
     size: u16,
 }
 
+/// How Capta initializes an audio client, in one place, so every attempt opens the same mode.
+/// A shared-mode stream that the client polls, rather than one the engine drives with an event,
+/// gets an engine buffer of the length asked for, and the periodicity must be 0.
+#[derive(Clone, Copy)]
+pub(crate) struct SharedCapture {
+    format: WaveFormatEx,
+    flags: u32,
+    buffer: i64,
+    periodicity: i64,
+}
+
+impl SharedCapture {
+    /// One channel of 32-bit floats at `rate`, in a 2 s engine buffer.
+    pub(crate) fn mono_f32(rate: u32) -> SharedCapture {
+        SharedCapture {
+            format: WaveFormatEx::mono_f32(rate),
+            flags: STREAM_FLAGS,
+            buffer: ENGINE_BUFFER,
+            periodicity: 0,
+        }
+    }
+}
+
 impl WaveFormatEx {
     /// One channel of 32-bit floats at `rate`.
-    pub(crate) fn mono_f32(rate: u32) -> WaveFormatEx {
+    fn mono_f32(rate: u32) -> WaveFormatEx {
         WaveFormatEx {
             format_tag: WAVE_FORMAT_IEEE_FLOAT,
             channels: 1,
@@ -231,7 +261,7 @@ struct AudioClientVtbl {
     start: Method0,
     stop: Method0,
     reset: usize,
-    set_event_handle: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32,
+    set_event_handle: usize,
     get_service: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
 }
 
@@ -435,7 +465,7 @@ impl<'a> Enumerator<'a> {
     }
 
     /// The capture endpoints that are present and enabled.
-    pub(crate) fn active_captures(&self) -> Result<Vec<Endpoint<'a>>, Hresult> {
+    pub(crate) fn active_captures(&self) -> Result<Captures<'a>, Hresult> {
         let enumerate = self.0.vtbl().enum_audio_endpoints;
         let mut collection = ptr::null_mut();
         // SAFETY: as in `default_capture`, with a valid state mask.
@@ -450,23 +480,32 @@ impl<'a> Enumerator<'a> {
         Hresult(code).ok()?;
         // SAFETY: on success EnumAudioEndpoints left an IMMDeviceCollection pointer with a
         // reference for the caller.
-        let collection: Object<'a, CollectionVtbl> = unsafe { Object::from_raw(collection) }?;
+        unsafe { Object::from_raw(collection) }.map(Captures)
+    }
+}
 
-        let get_count = collection.vtbl().get_count;
+/// A list of endpoints, read one at a time.
+pub(crate) struct Captures<'a>(Object<'a, CollectionVtbl>);
+
+impl<'a> Captures<'a> {
+    /// How many endpoints the list says it has, which the caller bounds.
+    pub(crate) fn count(&self) -> Result<u32, Hresult> {
+        let get_count = self.0.vtbl().get_count;
         let mut count = 0;
         // SAFETY: `this` is a live IMMDeviceCollection and `count` a valid place for the count.
-        Hresult(unsafe { get_count(collection.this(), &mut count) }).ok()?;
-        let item = collection.vtbl().item;
-        let mut endpoints = Vec::new();
-        for index in 0..count {
-            let mut device = ptr::null_mut();
-            // SAFETY: `index` is below the count the collection gave, and `device` is a valid
-            // place for the result.
-            Hresult(unsafe { item(collection.this(), index, &mut device) }).ok()?;
-            // SAFETY: on success Item left an IMMDevice pointer with a reference for the caller.
-            endpoints.push(Endpoint(unsafe { Object::from_raw(device) }?));
-        }
-        Ok(endpoints)
+        Hresult(unsafe { get_count(self.0.this(), &mut count) }).ok()?;
+        Ok(count)
+    }
+
+    /// The endpoint at `index`, which must be below the count.
+    pub(crate) fn get(&self, index: u32) -> Result<Endpoint<'a>, Hresult> {
+        let item = self.0.vtbl().item;
+        let mut device = ptr::null_mut();
+        // SAFETY: `this` is a live IMMDeviceCollection and `device` a valid place for the
+        // result. An index past the end is an error the call returns, not undefined behaviour.
+        Hresult(unsafe { item(self.0.this(), index, &mut device) }).ok()?;
+        // SAFETY: on success Item left an IMMDevice pointer with a reference for the caller.
+        unsafe { Object::from_raw(device) }.map(Endpoint)
     }
 }
 
@@ -605,25 +644,21 @@ unsafe fn read_wide(text: NonNull<u16>) -> Option<String> {
 pub(crate) struct AudioClient<'a>(Object<'a, AudioClientVtbl>);
 
 impl<'a> AudioClient<'a> {
-    /// Opens a shared-mode stream in `format`, with an engine buffer of `buffer` in 100 ns
-    /// units.
-    pub(crate) fn initialize(
-        &self,
-        format: &WaveFormatEx,
-        flags: u32,
-        buffer: i64,
-    ) -> Result<(), Hresult> {
+    /// Opens the stream that `capture` describes.
+    pub(crate) fn initialize(&self, capture: &SharedCapture) -> Result<(), Hresult> {
         let initialize = self.0.vtbl().initialize;
-        // SAFETY: `this` is a live IAudioClient, `format` a valid WAVEFORMATEX for the call, the
-        // periodicity 0 as shared mode requires, and the session null for the default one.
+        // SAFETY: `this` is a live IAudioClient, the format a valid WAVEFORMATEX that lives in
+        // `capture` during the call, the mode, flags, buffer and periodicity a combination that
+        // Initialize documents for shared mode without events, and the session null for the
+        // default one.
         let code = unsafe {
             initialize(
                 self.0.this(),
                 AUDCLNT_SHAREMODE_SHARED,
-                flags,
-                buffer,
-                0,
-                format,
+                capture.flags,
+                capture.buffer,
+                capture.periodicity,
+                &capture.format,
                 ptr::null(),
             )
         };
@@ -646,21 +681,13 @@ impl<'a> AudioClient<'a> {
         Ok(rate)
     }
 
-    /// The engine buffer's size in frames.
+    /// The engine buffer's size in frames, which the caller bounds.
     pub(crate) fn buffer_frames(&self) -> Result<u32, Hresult> {
         let get_buffer_size = self.0.vtbl().get_buffer_size;
         let mut frames = 0;
         // SAFETY: `this` is a live, initialized IAudioClient and `frames` a valid place.
         Hresult(unsafe { get_buffer_size(self.0.this(), &mut frames) }).ok()?;
         Ok(frames)
-    }
-
-    /// Has the engine signal `event` whenever a packet is ready.
-    pub(crate) fn set_event(&self, event: &Event) -> Result<(), Hresult> {
-        let set_event_handle = self.0.vtbl().set_event_handle;
-        // SAFETY: `this` is a live, initialized IAudioClient, and the handle is an event that
-        // outlives the client, since the capture thread drops the client first.
-        Hresult(unsafe { set_event_handle(self.0.this(), event.raw()) }).ok()
     }
 
     pub(crate) fn capture_client(&self) -> Result<CaptureClient<'a>, Hresult> {
@@ -694,8 +721,8 @@ pub(crate) struct CaptureClient<'a>(Object<'a, CaptureClientVtbl>);
 pub(crate) struct Packet<'p> {
     pub flags: u32,
     pub frames: u32,
-    /// The packet's bytes, or none when the engine described more frames than its buffer holds
-    /// or gave no data.
+    /// The packet's bytes, or none when the engine described more frames than its buffer
+    /// holds or than `limit` bytes, or gave no data.
     pub bytes: Option<&'p [u8]>,
 }
 
@@ -710,11 +737,13 @@ impl CaptureClient<'_> {
     }
 
     /// Hands the next packet to `read` and releases it after. Returns none when no packet was
-    /// ready. Frames are `frame_bytes` long, and the engine's buffer holds `buffer_frames`.
+    /// ready. Frames are `frame_bytes` long, the engine's buffer holds `buffer_frames`, and a
+    /// packet may be at most `limit` bytes.
     pub(crate) fn read_packet<R>(
         &self,
         frame_bytes: usize,
         buffer_frames: u32,
+        limit: usize,
         read: impl FnOnce(Packet<'_>) -> R,
     ) -> Result<Option<R>, Hresult> {
         let get_buffer = self.0.vtbl().get_buffer;
@@ -737,16 +766,14 @@ impl CaptureClient<'_> {
             return Ok(None);
         }
         code.ok()?;
-        let length = usize::try_from(frames)
-            .ok()
-            .and_then(|frames| frames.checked_mul(frame_bytes));
+        let length = byte_length(frames, frame_bytes, limit).filter(|_| frames <= buffer_frames);
         let bytes = match length {
             Some(0) => Some(&[][..]),
-            Some(length) if frames <= buffer_frames && !data.is_null() => {
+            Some(length) if !data.is_null() => {
                 // SAFETY: on success GetBuffer left a pointer to `frames` frames of the
-                // client's format, `length` bytes the engine keeps unchanged until
-                // ReleaseBuffer, which runs only after `read` returns, and `read` can't keep
-                // the slice past that.
+                // client's format, `length` bytes, which `byte_length` keeps within
+                // `isize::MAX`. The engine keeps them unchanged until ReleaseBuffer, which runs
+                // only after `read` returns, and `read` can't keep the slice past that.
                 Some(unsafe { std::slice::from_raw_parts(data.cast_const(), length) })
             }
             _ => None,
@@ -767,7 +794,8 @@ impl CaptureClient<'_> {
 }
 
 /// An auto-reset event, closed when dropped. A duplicate refers to the same event, and any
-/// thread may set or wait on it.
+/// thread may set or wait on it. Only Capta's own threads use it, the audio engine never sees
+/// it.
 pub(crate) struct Event(OwnedHandle);
 
 impl Event {
@@ -841,6 +869,84 @@ mod tests {
                 [0xb1, 0x78, 0xc2, 0xf5, 0x68, 0xa7, 0x03, 0xb2]
             )
         );
+
+        use std::mem::offset_of as at;
+        assert_eq!(
+            [
+                at!(Guid, data1),
+                at!(Guid, data2),
+                at!(Guid, data3),
+                at!(Guid, data4)
+            ],
+            [0, 4, 6, 8]
+        );
+        assert_eq!([at!(PropertyKey, fmtid), at!(PropertyKey, pid)], [0, 16]);
+        assert_eq!([at!(PropVariant, vt), at!(PropVariant, value)], [0, 8]);
+        assert_eq!(
+            [
+                at!(WaveFormatEx, format_tag),
+                at!(WaveFormatEx, channels),
+                at!(WaveFormatEx, samples_per_sec),
+                at!(WaveFormatEx, avg_bytes_per_sec),
+                at!(WaveFormatEx, block_align),
+                at!(WaveFormatEx, bits_per_sample),
+                at!(WaveFormatEx, size),
+            ],
+            [0, 2, 4, 8, 12, 14, 16]
+        );
+
+        // Each method's place in its vtable, in function pointers, as the headers list them.
+        let slot = |offset: usize| offset / size_of::<usize>();
+        assert_eq!(
+            [
+                slot(at!(UnknownVtbl, query_interface)),
+                slot(at!(UnknownVtbl, add_ref)),
+                slot(at!(UnknownVtbl, release)),
+            ],
+            [0, 1, 2]
+        );
+        assert_eq!(
+            [
+                slot(at!(EnumeratorVtbl, enum_audio_endpoints)),
+                slot(at!(EnumeratorVtbl, get_default_audio_endpoint)),
+            ],
+            [3, 4]
+        );
+        assert_eq!(
+            [
+                slot(at!(CollectionVtbl, get_count)),
+                slot(at!(CollectionVtbl, item))
+            ],
+            [3, 4]
+        );
+        assert_eq!(
+            [
+                slot(at!(DeviceVtbl, activate)),
+                slot(at!(DeviceVtbl, open_property_store)),
+                slot(at!(DeviceVtbl, get_id)),
+            ],
+            [3, 4, 5]
+        );
+        assert_eq!(slot(at!(PropertyStoreVtbl, get_value)), 5);
+        assert_eq!(
+            [
+                slot(at!(AudioClientVtbl, initialize)),
+                slot(at!(AudioClientVtbl, get_buffer_size)),
+                slot(at!(AudioClientVtbl, get_mix_format)),
+                slot(at!(AudioClientVtbl, start)),
+                slot(at!(AudioClientVtbl, stop)),
+                slot(at!(AudioClientVtbl, get_service)),
+            ],
+            [3, 4, 8, 10, 11, 14]
+        );
+        assert_eq!(
+            [
+                slot(at!(CaptureClientVtbl, get_buffer)),
+                slot(at!(CaptureClientVtbl, release_buffer)),
+                slot(at!(CaptureClientVtbl, get_next_packet_size)),
+            ],
+            [3, 4, 5]
+        );
     }
 
     #[test]
@@ -859,9 +965,39 @@ mod tests {
     fn the_apartment_lists_capture_endpoints() {
         let apartment = Apartment::enter().unwrap();
         let enumerator = apartment.enumerator().unwrap();
-        for endpoint in enumerator.active_captures().unwrap() {
+        let captures = enumerator.active_captures().unwrap();
+        for index in 0..captures.count().unwrap() {
+            let endpoint = captures.get(index).unwrap();
             assert!(endpoint.id().unwrap().is_some());
             let _ = endpoint.name().unwrap();
+        }
+    }
+
+    #[test]
+    fn every_stream_is_shared_and_polled_with_a_two_second_buffer() {
+        for rate in [8_000, 16_000, 44_100, 48_000, 384_000] {
+            let capture = SharedCapture::mono_f32(rate);
+            assert_eq!(
+                capture.flags & EVENT_CALLBACK,
+                0,
+                "no event-driven buffering"
+            );
+            assert_eq!(capture.periodicity, 0, "shared mode takes no periodicity");
+            assert_eq!(capture.buffer, 20_000_000);
+            let format = capture.format;
+            let (tag, channels, samples, bytes, align, bits, size) = (
+                format.format_tag,
+                format.channels,
+                format.samples_per_sec,
+                format.avg_bytes_per_sec,
+                format.block_align,
+                format.bits_per_sample,
+                format.size,
+            );
+            assert_eq!(
+                (tag, channels, samples, bytes, align, bits, size),
+                (WAVE_FORMAT_IEEE_FLOAT, 1, rate, rate * 4, 4, 32, 0)
+            );
         }
     }
 }

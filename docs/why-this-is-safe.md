@@ -15,12 +15,16 @@ top of the file's section.
 - Each function, interface and structure is declared by hand from the system's SDK headers,
   with the headers' calling convention (`extern "system"` on Windows, which is `stdcall` on
   32-bit x86, and `extern "C"` on macOS). The tests `layouts_match_the_headers` check the size
-  of every structure against the headers, on the system it's for.
+  of every structure and the offset of every field against the headers, and the place of every
+  method in every vtable, on the system it's for.
 - A call's out-values are used only after its status says it succeeded. A failure becomes an
   `Error`, and what the call might have left in an out-pointer is ignored.
-- Everything the system hands back is checked before use. Counts and sizes are compared with
-  the room they describe, strings are read up to a limit, and a reply that doesn't fit is an
-  error, never a panic.
+- Everything the system hands back is checked before use. Counts and sizes have limits of
+  their own, independent of anything else the system reports, and are compared with the room
+  they describe. Strings are read up to a limit. A reply that doesn't fit is an error, never a
+  panic or an allocation of what the system claims.
+- Of a structure the system fills, Capta reads only the fields the system's documentation
+  says it sets, field by field through raw pointers, never the whole structure.
 - No callback Capta gives the system can unwind. The one callback, macOS's buffer callback, is
   `extern "C"`, so a panic in it would abort rather than unwind into the system, and it has no
   code that panics.
@@ -37,7 +41,9 @@ wrappers hold `NonNull` pointers and a `PhantomData<&Apartment>`, so they're nei
 calling them from the thread that made them is always allowed.
 
 The one value that crosses threads is `Event`, a kernel event handle in an `OwnedHandle`, which
-any thread may set or wait on.
+any thread may set or wait on. Only Capta's own threads use it, to end the capture thread's
+pause when the `Capture` handle drops. The audio engine never sees it, so its lifetime matters
+only to Capta, and each `OwnedHandle` closes its own handle once.
 
 ### Interface pointers and their references
 
@@ -68,9 +74,9 @@ each points to a local, a `static` or memory the wrapper owns.
 | `Enumerator::default_capture` | `Object::from_raw` | On success, an `IMMDevice` with a reference for the caller. |
 | `Enumerator::active_captures` | `IMMDeviceEnumerator::EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &collection)` | As above, with a valid state mask. |
 | `Enumerator::active_captures` | `Object::from_raw` | On success, an `IMMDeviceCollection` with a reference for the caller. |
-| `Enumerator::active_captures` | `IMMDeviceCollection::GetCount(&count)` | A local out-value. |
-| `Enumerator::active_captures` | `IMMDeviceCollection::Item(index, &device)` | `index` is below the count the collection gave, and the out-pointer is a local. A failed item fails the listing rather than being read. |
-| `Enumerator::active_captures` | `Object::from_raw` | On success, an `IMMDevice` with a reference for the caller. |
+| `Captures::count` | `IMMDeviceCollection::GetCount(&count)` | A local out-value. The caller refuses a count above 4096 before it reads any item, so the count never sizes an allocation or a loop. |
+| `Captures::get` | `IMMDeviceCollection::Item(index, &device)` | The out-pointer is a local. The caller passes indices below the bounded count, and an index past the end would be an error the call returns, not undefined behaviour. A failed item fails the listing rather than being read. |
+| `Captures::get` | `Object::from_raw` | On success, an `IMMDevice` with a reference for the caller. |
 | `Endpoint::id` | `IMMDevice::GetId(&text)` | A local out-pointer. On success it holds a null-terminated string allocated with `CoTaskMemAlloc`, which `TaskMemory` frees after the read. |
 | `Endpoint::id` | `read_wide(text)` | The string from `GetId` is null-terminated and stays allocated until `TaskMemory` drops, after the read. |
 | `Endpoint::name` | `IMMDevice::OpenPropertyStore(STGM_READ, &store)` | A valid access mode and a local out-pointer. |
@@ -83,18 +89,17 @@ each points to a local, a `static` or memory the wrapper owns.
 | `Drop for PropVariant` | `PropVariantClear(self)` | `self` is a valid `PROPVARIANT`, empty or filled by the system. Clearing frees what it holds and leaves it empty, and an empty one needs nothing. |
 | `Drop for TaskMemory` | `CoTaskMemFree(memory)` | The memory came from `GetId` or `GetMixFormat`, whose contracts hand it to the caller to free with `CoTaskMemFree`, and the wrapper frees it once. |
 | `read_wide` (an `unsafe fn`) | `unit.read_unaligned()` | The caller promises a null-terminated UTF-16 string. The loop stops at the terminator or after 32 Ki units, so each read lies within the string. The pointer is formed with `wrapping_add`, so forming it is never undefined, and the read doesn't need alignment. |
-| `AudioClient::initialize` | `IAudioClient::Initialize(SHARED, flags, buffer, 0, &format, NULL)` | `format` is a packed `WAVEFORMATEX` for one channel of floats, valid during the call. Shared mode needs a periodicity of 0, and a null session joins the default one. A refused format is an error the caller handles by making a new client. |
+| `AudioClient::initialize` | `IAudioClient::Initialize(SHARED, AUTOCONVERTPCM \| SRC_DEFAULT_QUALITY, 2 s, 0, &format, NULL)` | Every call takes its arguments from `SharedCapture`, so every attempt opens the same mode. `format` is a packed `WAVEFORMATEX` for one channel of floats, valid during the call. The stream is shared and polled, without `EVENTCALLBACK`, the mode in which Initialize documents a buffer duration of the client's choosing and requires a periodicity of 0, and Microsoft's capture example uses. A null session joins the default one. A refused format is an error the caller handles by making a new client. |
 | `AudioClient::mix_rate` | `IAudioClient::GetMixFormat(&format)` | A local out-pointer. On success it points to a `WAVEFORMATEX`, or a larger structure that begins with one, allocated with `CoTaskMemAlloc`. |
 | `AudioClient::mix_rate` | `format.read()` | The memory holds at least a `WAVEFORMATEX`, and the struct is packed, so any address is aligned for it. `TaskMemory` frees it after the read. |
-| `AudioClient::buffer_frames` | `IAudioClient::GetBufferSize(&frames)` | A local out-value, on an initialized client. |
-| `AudioClient::set_event` | `IAudioClient::SetEventHandle(event)` | The handle is an open event that `Client` owns. Its fields drop in order, so the audio client is released before the event's handle closes, and the capture thread stops the client before both. The `Capture` handle's duplicate keeps the event itself alive longer still. |
+| `AudioClient::buffer_frames` | `IAudioClient::GetBufferSize(&frames)` | A local out-value, on an initialized client. The caller refuses 0 and more than 1,536,000 frames, 4 s at the highest rate. |
 | `AudioClient::capture_client` | `IAudioClient::GetService(IID_IAudioCaptureClient, &capture)` | A `static` interface id and a local out-pointer, on an initialized client. |
 | `AudioClient::capture_client` | `Object::from_raw` | On success, an `IAudioCaptureClient` with a reference for the caller. |
 | `AudioClient::start` | `IAudioClient::Start()` | An initialized client. |
 | `AudioClient::stop` | `IAudioClient::Stop()` | A live client. Stopping a stopped client is allowed and returns `S_FALSE`. |
 | `CaptureClient::next_packet_frames` | `IAudioCaptureClient::GetNextPacketSize(&frames)` | A local out-value. |
 | `CaptureClient::read_packet` | `IAudioCaptureClient::GetBuffer(&data, &frames, &flags, NULL, NULL)` | Three local out-values, and the two positions are optional. `AUDCLNT_S_BUFFER_EMPTY` means no packet, and nothing is read. |
-| `CaptureClient::read_packet` | `slice::from_raw_parts(data, length)` | Made only when `data` isn't null, `frames` is at most the engine buffer's size from `GetBufferSize`, and `frames × 4` doesn't overflow. The engine keeps those bytes, frames of the client's mono float format, unchanged until `ReleaseBuffer`. The slice goes to a closure that can't keep it, since its lifetime is the closure's own, and `ReleaseBuffer` runs only after the closure returns. |
+| `CaptureClient::read_packet` | `slice::from_raw_parts(data, length)` | Made only when `data` isn't null, `frames` is at most the engine buffer's bounded size, and `byte_length` finds `frames × 4` without overflow, within 6,144,000 bytes and within `isize::MAX`, as a slice requires on 32-bit systems too. The engine keeps those bytes, frames of the client's mono float format, unchanged until `ReleaseBuffer`. The slice goes to a closure that can't keep it, since its lifetime is the closure's own, and `ReleaseBuffer` runs only after the closure returns. |
 | `CaptureClient::read_packet` | `IAudioCaptureClient::ReleaseBuffer(released)` | Releases the packet's frames, or 0 for a packet that couldn't be read, which the API allows. |
 | `Event::new` | `CreateEventW(NULL, FALSE, FALSE, NULL)` | Default security, auto-reset, not set, unnamed. A null result is an error, read from `GetLastError`. |
 | `Event::new` | `OwnedHandle::from_raw_handle(handle)` | The handle is new, open and owned by nothing else, and an event needs only `CloseHandle`, which `OwnedHandle` does. |
@@ -117,10 +122,17 @@ The queue is made with a null run loop, so Audio Toolbox calls `on_buffer` on a 
 own. That's the only code of Capta's that runs on one of Core Audio's threads. It takes no
 lock, allocates nothing, and calls nothing but `AudioQueueEnqueueBuffer`, which the Audio Queue
 Services guide calls from the callback to give the buffer back. It shares the `Inbox` with the
-capture thread, and everything in the inbox changes through atomics. The ring in it has one
-producer, the callback, and one consumer, the capture thread, and it's safe code. The capture
-thread doesn't wait for the callback, it looks at the ring every 5 ms, so the callback never
-has to wake anything.
+capture thread, and everything in the inbox changes through atomics. The capture thread
+doesn't wait for the callback, it looks at the ring every 5 ms, so the callback never has to
+wake anything.
+
+The ring in the inbox is safe code with one consumer, the capture thread, and it must have
+one producer at a time. Apple's documentation says the queue calls back on "one of the audio
+queue's internal threads" without saying that two callbacks never overlap, so Capta enforces
+it. A callback takes the inbox's `taking` flag with an atomic swap before it pushes and gives
+it back after, with acquire and release ordering, so callbacks on different threads see each
+other's pushes. A callback that finds the flag taken pushes nothing and ends the capture with
+`Protocol`, so overlapping callbacks can't interleave samples unnoticed.
 
 ### The inbox's lifetime
 
@@ -148,8 +160,13 @@ access to memory the callback reads.
 | `CfString::text` | `CFStringGetCString(string, bytes, size, UTF8)` | `bytes` has `size` bytes of room, at most 64 KiB, and the call writes at most that, the string and a terminating NUL, or fails. The text is read up to the first NUL, and must be UTF-8. |
 | `Drop for CfString` | `CFRelease(string)` | `self` owns one reference, given back once. |
 | `on_buffer` | `&*user.cast::<Inbox>()` | `user` is `Arc::as_ptr` of the inbox, alive until after the queue is disposed of, as argued above. The reference is shared, the inbox is `Sync`, and nothing makes a `&mut` to it. |
-| `on_buffer` | `buffer.read()` | The queue hands the callback one of its own buffers, an `AudioQueueBuffer`, and nothing else touches it until it's enqueued again at the end of the callback. A null buffer returns early. |
-| `on_buffer` | `start.as_ref()` | When not null, `start` points to the buffer's time stamp, valid during the callback. Its sample time is used only when its flags say it's valid. |
+| `on_buffer` | `read_filled(buffer)` | The queue hands the callback one of its own buffers, made by `AudioQueueAllocateBuffer`, which sets its capacity and data pointer, and the queue sets the byte size when it fills it. Nothing writes those until the buffer is enqueued again at the end of the callback. A null buffer returns early. |
+| `read_filled` (an `unsafe fn`) | Reads `mAudioDataBytesCapacity` through a raw pointer | The caller promises the field is initialized. Its pointer is the buffer's address plus the field's `offset_of!` in the `repr(C)` struct, so it's inside the buffer and aligned for a `u32`. No reference to the struct is made, and the packet-description fields and `mUserData`, which Apple documents only for buffers with packet descriptions or as the caller's own, are never read. Miri runs `a_filled_buffer_is_read_without_its_unset_fields` on macOS, where only these three fields are written. |
+| `read_filled` | Reads `mAudioData` | As above, for the pointer field, aligned for a pointer. |
+| `read_filled` | Reads `mAudioDataByteSize` | As above, for the byte size. |
+| `on_buffer` | `read_start(start)` | When not null, `start` points to the buffer's time stamp, valid during the callback. AudioTimeStamp's `mFlags` says which of its fields are set. |
+| `read_start` (an `unsafe fn`) | Reads `mFlags` through a raw pointer | The caller promises the flags are initialized, and the pointer is the field's offset in the `repr(C)` struct, aligned for a `u32`. |
+| `read_start` | Reads `mSampleTime` | Read only when `kAudioTimeStampSampleTimeValid` is set, so the field is set, at an offset aligned for an `f64`. Miri runs `a_time_stamp_is_read_only_as_far_as_its_flags_say`. |
 | `on_buffer` | `slice::from_raw_parts(data, byte_size)` | Made only when `data` isn't null and `byte_size` is at most `capacity`. The buffer's data holds `capacity` bytes, the queue filled the first `byte_size`, and they don't change until the buffer is enqueued again, after the slice's last use. A byte size that isn't whole samples is an error. |
 | `on_buffer` | `AudioQueueEnqueueBuffer(queue, buffer, 0, NULL)` | `queue` and `buffer` are the ones the queue passed, and an input queue takes no packet descriptions. A failure is recorded and ends the capture. |
 | `Queue::new_input` | `AudioQueueNewInput(&format, on_buffer, user, NULL, NULL, 0, &queue)` | `format` is a local linear PCM description of one channel of native-endian floats. `on_buffer` has the callback's signature, `user` is the inbox that outlives the queue, a null run loop has the queue call back on its own thread, the flags are 0 as reserved, and the out-pointer is a local. A null queue on success is an error. |
@@ -162,10 +179,14 @@ access to memory the callback reads.
 The three `unsafe extern "C"` blocks declare the CoreFoundation, CoreAudio and AudioToolbox
 functions, linked as the system frameworks they are.
 
+The tests have nine more blocks, in `a_filled_buffer_is_read_without_its_unset_fields` and
+`a_time_stamp_is_read_only_as_far_as_its_flags_say`. Each writes one field of a
+`MaybeUninit` structure through a pointer formed the way `read_filled` and `read_start` form
+theirs, or calls one of the two on a structure whose promised fields it wrote.
+
 ## What the code relies on that a test can't show
 
 The SDKs' calling conventions, layouts and constants are copied from the headers, and the
-layout tests and the recordings in CI exercise them on the real systems. Two promises come
-from Apple's documentation alone. One is that a disposed queue calls back no more. The other
-is that a queue calls back on one thread at a time, which keeps the ring single-producer. A
-broken second promise would garble samples, not memory, since the ring is safe code.
+layout tests and the recordings in CI exercise them on the real systems. One promise comes
+from Apple's documentation alone, that a disposed queue calls back no more once
+`AudioQueueDispose` returns, when it's called from outside a callback, as AudioQueue.h says.
